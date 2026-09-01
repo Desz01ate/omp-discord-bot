@@ -10,11 +10,16 @@ if [ ! -x "$BUN_BIN" ]; then
   exit 1
 fi
 
+chmod +x "$PROJECT_DIR/scripts/run.sh"
+
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SERVICE_NAME="omp-discord-bot.service"
 SERVICE_FILE="$SYSTEMD_USER_DIR/$SERVICE_NAME"
 
 mkdir -p "$SYSTEMD_USER_DIR"
+
+echo "Importing user environment to systemd user daemon..."
+systemctl --user import-environment PATH LITELLM_BASE_URL LD_LIBRARY_PATH HOME SHELL 2>/dev/null || true
 
 echo "Creating systemd user service at $SERVICE_FILE..."
 
@@ -27,9 +32,9 @@ After=network.target
 Type=simple
 WorkingDirectory=$PROJECT_DIR
 EnvironmentFile=-$PROJECT_DIR/.env
-Environment=PATH=$PATH:$HOME/.bun/bin:$HOME/.local/bin
 Environment=HOME=$HOME
-ExecStart=$BUN_BIN run src/index.ts
+Environment=PATH=$PATH:$HOME/.bun/bin:$HOME/.local/bin
+ExecStart=$PROJECT_DIR/scripts/run.sh
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -39,9 +44,10 @@ StandardError=journal
 WantedBy=default.target
 EOF
 
-echo "Reloading systemd daemon and enabling service..."
+echo "Reloading systemd daemon and restarting service..."
 systemctl --user daemon-reload
 systemctl --user enable --now "$SERVICE_NAME"
+systemctl --user restart "$SERVICE_NAME"
 
 echo ""
 echo "=== Service initialized ==="

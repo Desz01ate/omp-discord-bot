@@ -14,6 +14,8 @@ import {
   TextChannel,
   ChannelType,
   EmbedBuilder,
+  MessageFlags,
+  Events,
   type AutocompleteInteraction,
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
@@ -566,7 +568,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!channel || (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement)) {
       await interaction.reply({
         content: "Please run this command in a standard guild text channel.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -607,7 +609,7 @@ client.on("interactionCreate", async (interaction) => {
   if (!session) {
     await interaction.reply({
       content: "⚠️ This command must be executed inside an active OMP thread created by `/omp-new`.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -738,7 +740,7 @@ client.on("messageCreate", (message) => {
   });
 });
 
-client.on("ready", () => {
+client.on(Events.ClientReady, () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
 });
 
