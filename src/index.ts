@@ -31,6 +31,17 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   console.error("Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in environment.");
   process.exit(1);
 }
+const ALLOWED_USERS_RAW = process.env.ALLOWED_USERS || process.env.WHITELISTED_USERS || "";
+const allowedUserIds = new Set(
+  ALLOWED_USERS_RAW.split(/[\s,]+/)
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0),
+);
+
+function isUserAllowed(userId: string): boolean {
+  if (allowedUserIds.size === 0) return true;
+  return allowedUserIds.has(userId);
+}
 
 type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
@@ -591,6 +602,16 @@ async function handleRpcEvent(
       const confirmation = await msg
         .awaitMessageComponent({
           componentType: ComponentType.Button,
+          filter: async (btnInteraction) => {
+            if (!isUserAllowed(btnInteraction.user.id)) {
+              await btnInteraction.reply({
+                content: "⛔ You are not authorized to respond to this approval request.",
+                flags: MessageFlags.Ephemeral,
+              });
+              return false;
+            }
+            return true;
+          },
           time: timeoutSeconds * 1000,
         })
         .catch(() => null);
@@ -761,6 +782,20 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
 
 // Handle Slash Command Executions
 client.on("interactionCreate", async (interaction) => {
+  if (!isUserAllowed(interaction.user.id)) {
+    if (interaction.isAutocomplete()) {
+      await interaction.respond([]);
+      return;
+    }
+    if (interaction.isRepliable()) {
+      await interaction.reply({
+        content: "⛔ You are not authorized to use this bot.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    return;
+  }
+
   if (interaction.isAutocomplete()) {
     await handleAutocomplete(interaction);
     return;
@@ -936,6 +971,7 @@ client.on("interactionCreate", async (interaction) => {
 // Handle Chat Messages in Threads
 client.on("messageCreate", (message) => {
   if (message.author.bot) return;
+  if (!isUserAllowed(message.author.id)) return;
   const session = sessions.get(message.channelId);
   if (!session) return;
 
@@ -948,6 +984,11 @@ client.on("messageCreate", (message) => {
 
 client.on(Events.ClientReady, () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
+  if (allowedUserIds.size > 0) {
+    console.log(`🔒 User whitelist active: ${allowedUserIds.size} allowed user(s).`);
+  } else {
+    console.log("🔓 User whitelist inactive: all users permitted.");
+  }
 });
 
 client.login(DISCORD_TOKEN);

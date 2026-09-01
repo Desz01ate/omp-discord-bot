@@ -44,6 +44,9 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
    ```ini
    DISCORD_TOKEN=your_discord_bot_token_here
    DISCORD_CLIENT_ID=your_discord_application_client_id_here
+
+   # (Optional) Restrict access to specific Discord user IDs (comma-separated)
+   # ALLOWED_USERS=123456789012345678,987654321098765432
    ```
 
 3. **Install Dependencies**:
