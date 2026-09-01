@@ -41,6 +41,8 @@ interface SessionContext {
   activePromptMsg?: Message;
   currentStreamBuffer: string;
   lastEditTimestamp: number;
+  activeToolStatus?: string;
+  editTimer?: Timer;
 }
 
 interface OmpCommandMeta {
@@ -310,11 +312,183 @@ function createOmpSession(thread: ThreadChannel, cwd: string): SessionContext {
   });
 
   proc.exited.then((code) => {
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     sessions.delete(thread.id);
   });
 
   return session;
+}
+
+/**
+ * Format tool execution details into a concise, user-friendly status line.
+ */
+function formatToolStatus(toolName: string, rawArgs?: unknown, rawIntent?: unknown): string {
+  const intent = typeof rawIntent === "string" ? rawIntent.trim() : "";
+  if (intent) {
+    return `⚡ *${intent}* (\`${toolName}\`)`;
+  }
+
+  const args = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
+
+  if (toolName === "bash" && typeof args.command === "string") {
+    const cmd = args.command.trim();
+    const shortCmd = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
+    return `🔧 \`bash\`: \`${shortCmd}\``;
+  }
+
+  if ((toolName === "read" || toolName === "write" || toolName === "edit") && typeof args.path === "string") {
+    return `📄 \`${toolName}\`: \`${args.path}\``;
+  }
+
+  if (toolName === "grep") {
+    const pattern = typeof args.pattern === "string" ? args.pattern : "";
+    return `🔍 \`grep\`: \`${pattern}\``;
+  }
+
+  if (toolName === "glob") {
+    const pattern = typeof args.path === "string" ? args.path : "";
+    return `📂 \`glob\`: \`${pattern}\``;
+  }
+
+  if (toolName === "eval" && typeof args.title === "string") {
+    return `⚙️ \`eval\`: *${args.title}*`;
+  }
+
+  if (toolName === "lsp" && typeof args.action === "string") {
+    return `🧠 \`lsp\`: *${args.action}*`;
+  }
+
+  return `🔧 *Running \`${toolName}\`...*`;
+}
+
+/**
+ * Markdown-aware message splitter that splits cleanly on line boundaries and preserves code fences.
+ */
+function splitDiscordMessage(text: string, maxLength = 1950): string[] {
+  if (!text || text.length <= maxLength) {
+    return [text || ""];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+
+    let splitIndex = -1;
+    const window = remaining.slice(0, maxLength);
+
+    // 1. Prefer paragraph breaks
+    const lastParagraph = window.lastIndexOf("\n\n");
+    if (lastParagraph > maxLength * 0.4) {
+      splitIndex = lastParagraph + 2;
+    } else {
+      // 2. Line breaks
+      const lastLine = window.lastIndexOf("\n");
+      if (lastLine > maxLength * 0.4) {
+        splitIndex = lastLine + 1;
+      } else {
+        // 3. Word spaces
+        const lastSpace = window.lastIndexOf(" ");
+        if (lastSpace > maxLength * 0.4) {
+          splitIndex = lastSpace + 1;
+        } else {
+          splitIndex = maxLength;
+        }
+      }
+    }
+
+    let chunk = remaining.slice(0, splitIndex);
+    remaining = remaining.slice(splitIndex);
+
+    // Track open/closed markdown code fences across chunks
+    const lines = chunk.split("\n");
+    let currentFence: string | null = null;
+
+    for (const line of lines) {
+      const match = line.match(/^(\s*)(```+|~~~+)(.*)$/);
+      if (match) {
+        const marker = match[2];
+        const info = match[3].trim();
+        if (currentFence === null) {
+          currentFence = marker + (info ? info : "");
+        } else {
+          const fenceType = currentFence.startsWith("~") ? "~" : "`";
+          if (marker.startsWith(fenceType)) {
+            currentFence = null;
+          }
+        }
+      }
+    }
+
+    if (currentFence !== null) {
+      const fenceType = currentFence.startsWith("~") ? "~~~" : "```";
+      chunk += `\n${fenceType}`;
+      remaining = `${currentFence}\n` + remaining;
+    }
+
+    chunks.push(chunk);
+  }
+
+  return chunks;
+}
+
+/**
+ * Flush the active live preview to Discord.
+ */
+async function flushActivePromptMessage(session: SessionContext): Promise<void> {
+  if (session.editTimer) {
+    clearTimeout(session.editTimer);
+    session.editTimer = undefined;
+  }
+  if (!session.activePromptMsg) return;
+
+  const now = Date.now();
+  session.lastEditTimestamp = now;
+
+  let displayContent = "";
+  if (session.currentStreamBuffer) {
+    const textTail = session.currentStreamBuffer.slice(-1800);
+    if (session.activeToolStatus) {
+      displayContent = `${textTail}\n\n${session.activeToolStatus}`;
+    } else {
+      displayContent = textTail;
+    }
+  } else {
+    displayContent = session.activeToolStatus || "🤔 *Thinking...*";
+  }
+
+  if (displayContent.length > 1950) {
+    displayContent = displayContent.slice(-1950);
+  }
+
+  await session.activePromptMsg.edit(displayContent).catch(() => {});
+}
+
+/**
+ * Schedule throttled live update for Discord (~1 edit every 1.2s).
+ */
+function scheduleActivePromptUpdate(session: SessionContext): void {
+  if (!session.activePromptMsg) return;
+  const now = Date.now();
+  const elapsed = now - session.lastEditTimestamp;
+  const THROTTLE_MS = 1200;
+
+  if (elapsed >= THROTTLE_MS) {
+    void flushActivePromptMessage(session);
+  } else if (!session.editTimer) {
+    session.editTimer = setTimeout(() => {
+      session.editTimer = undefined;
+      void flushActivePromptMessage(session);
+    }, THROTTLE_MS - elapsed);
+  }
 }
 
 // Handle RPC Frames & Events
@@ -337,7 +511,12 @@ async function handleRpcEvent(
 
   // 2. Turn Start
   if (type === "agent_start") {
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
     session.currentStreamBuffer = "";
+    session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
     session.lastEditTimestamp = Date.now();
     return;
@@ -346,16 +525,18 @@ async function handleRpcEvent(
   // 3. Streaming Text Updates
   if (type === "message_update") {
     const assistantMessageEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
-    const delta = typeof assistantMessageEvent?.delta === "string" ? assistantMessageEvent.delta : undefined;
-    if (delta) {
-      session.currentStreamBuffer += delta;
+    const ameType = typeof assistantMessageEvent?.type === "string" ? assistantMessageEvent.type : "";
 
-      // Throttle Discord edits (~1 edit per 1.2 seconds)
-      const now = Date.now();
-      if (now - session.lastEditTimestamp > 1200 && session.activePromptMsg) {
-        session.lastEditTimestamp = now;
-        const text = session.currentStreamBuffer.slice(-1900);
-        await session.activePromptMsg.edit(text || "⏳ *Executing...*").catch(() => {});
+    // Only stream real assistant text_delta (avoid toolcall JSON and internal thinking leaking into stream)
+    if (ameType === "text_delta") {
+      const delta = typeof assistantMessageEvent?.delta === "string" ? assistantMessageEvent.delta : undefined;
+      if (delta) {
+        session.currentStreamBuffer += delta;
+        scheduleActivePromptUpdate(session);
+      }
+    } else if (ameType === "thinking_start" || ameType === "thinking_delta") {
+      if (!session.currentStreamBuffer && !session.activeToolStatus) {
+        scheduleActivePromptUpdate(session);
       }
     }
     return;
@@ -364,9 +545,22 @@ async function handleRpcEvent(
   // 4. Tool Execution Events
   if (type === "tool_execution_start") {
     const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-    const inputStr = JSON.stringify(event.input || {});
-    const truncated = inputStr.length > 80 ? inputStr.slice(0, 77) + "..." : inputStr;
-    await thread.send(`🔧 \`${toolName}\` \`${truncated}\``).catch(() => {});
+    const args = (event.args || event.input || {}) as Record<string, unknown>;
+    const intent = typeof event.intent === "string" ? event.intent : undefined;
+
+    session.activeToolStatus = formatToolStatus(toolName, args, intent);
+    scheduleActivePromptUpdate(session);
+    return;
+  }
+
+  if (type === "tool_execution_end") {
+    session.activeToolStatus = undefined;
+    scheduleActivePromptUpdate(session);
+    return;
+  }
+
+  if (type === "turn_start" || type === "turn_end") {
+    session.activeToolStatus = undefined;
     return;
   }
 
@@ -440,13 +634,12 @@ async function handleRpcEvent(
             ? event.content
             : JSON.stringify(event);
 
-    if (rawOutput.trim()) {
-      if (rawOutput.length <= 1950) {
-        await thread.send(`\`\`\`\n${rawOutput}\n\`\`\``).catch(() => {});
-      } else {
-        for (let i = 0; i < rawOutput.length; i += 1900) {
-          await thread.send(`\`\`\`\n${rawOutput.slice(i, i + 1900)}\n\`\`\``).catch(() => {});
-        }
+    const trimmed = rawOutput.trim();
+    if (trimmed) {
+      const formatted = trimmed.startsWith("```") ? trimmed : `\`\`\`\n${trimmed}\n\`\`\``;
+      const chunks = splitDiscordMessage(formatted, 1900);
+      for (const chunk of chunks) {
+        await thread.send(chunk).catch(() => {});
       }
     }
     return;
@@ -480,29 +673,42 @@ async function handleRpcEvent(
 
   // 8. Turn Finish
   if (type === "agent_end") {
-    if (session.activePromptMsg && session.currentStreamBuffer) {
-      const full = session.currentStreamBuffer;
-      if (full.length <= 1950) {
-        await session.activePromptMsg.edit(full).catch(() => {});
-      } else {
-        await session.activePromptMsg.edit(full.slice(0, 1950)).catch(() => {});
-        for (let i = 1950; i < full.length; i += 1950) {
-          await thread.send(full.slice(i, i + 1950)).catch(() => {});
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
+
+    if (session.activePromptMsg) {
+      const full = session.currentStreamBuffer.trim();
+      if (full) {
+        const chunks = splitDiscordMessage(full, 1950);
+        await session.activePromptMsg.edit(chunks[0]).catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await thread.send(chunks[i]).catch(() => {});
         }
+      } else {
+        await session.activePromptMsg.edit("✅ *Completed.*").catch(() => {});
       }
     }
+
     session.activePromptMsg = undefined;
     session.currentStreamBuffer = "";
+    session.activeToolStatus = undefined;
     return;
   }
 
   // 9. Prompt Result without agent turn (Local command completion)
   if (type === "prompt_result" && event.agentInvoked === false) {
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
     if (session.activePromptMsg) {
       await session.activePromptMsg.delete().catch(() => {});
       session.activePromptMsg = undefined;
     }
     session.currentStreamBuffer = "";
+    session.activeToolStatus = undefined;
   }
 }
 
