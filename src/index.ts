@@ -16,16 +16,48 @@ import {
   EmbedBuilder,
   MessageFlags,
   Events,
+  AttachmentBuilder,
   type AutocompleteInteraction,
+  type ButtonInteraction,
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
-import { SessionManager, type SessionContext, type OmpProcess } from "./session-manager";
+import { SessionManager, resolveOmpSessionPath, type SessionContext, type OmpProcess } from "./session-manager";
+import {
+  buildDynamicThreadName,
+  buildQuickActionRow,
+  parseQuickActionId,
+  parseReactionShortcut,
+  isDefaultThreadName,
+} from "./ui-helpers";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
+import {
+  commitWorkspaceChanges,
+  createGitWorktree,
+  formatDiffForDiscord,
+  inspectGitDiff,
+  isDownloadableWorkspaceFile,
+  isInsideWorkspace,
+  listWorkspaceFiles,
+  MAX_WORKSPACE_DOWNLOAD_BYTES,
+  removeGitWorktree,
+  resolveWorkspaceFile,
+  type WorktreeInfo,
+} from "./workspace";
+import {
+  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  formatHudEmbed,
+  formatToolExecutionEmbed,
+  formatToolOutputPreview,
+  formatToolTracesEmbed,
+  toolIcon,
+  type HudState,
+  type ToolExecutionTrace,
+} from "./observability";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -41,17 +73,14 @@ const allowedUserIds = new Set(
     .filter((id) => id.length > 0),
 );
 
+const quickActionLastUsedAt = new Map<string, number>();
+const QUICK_ACTION_DEBOUNCE_MS = 750;
+
 function isUserAllowed(userId: string): boolean {
   if (allowedUserIds.size === 0) return false;
   return allowedUserIds.has(userId);
 }
 
-function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
-  const normalizedRoot = resolve(rootDir);
-  const normalizedTarget = resolve(targetPath);
-  const rel = relative(normalizedRoot, normalizedTarget);
-  return !rel.startsWith("..") && !isAbsolute(rel);
-}
 
 function getSanitizedChildEnv(): Record<string, string | undefined> {
   const env = { ...process.env };
@@ -109,6 +138,137 @@ async function getGitBranch(cwd: string): Promise<string | null> {
     return commit ? `detached@${commit}` : null;
   } catch {
     return null;
+  }
+}
+
+async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dirty: boolean | null }> {
+  try {
+    const branch = await getGitBranch(cwd);
+    if (!branch) return { branch: null, dirty: null };
+    const statusProc = spawn(["git", "-c", "safe.directory=*", "status", "--porcelain"], {
+      cwd,
+      stderr: "ignore",
+    });
+    const status = (await new Response(statusProc.stdout).text()).trim();
+    return { branch, dirty: status.length > 0 };
+  } catch {
+    return { branch: null, dirty: null };
+  }
+}
+
+function readNumericValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
+  const usage = (data.contextUsage || data.tokenUsage || data.usage) as Record<string, unknown> | undefined;
+  const source = usage && typeof usage === "object" ? usage : data;
+  const input = readNumericValue(source.input ?? source.inputTokens ?? source.promptTokens);
+  const output = readNumericValue(source.output ?? source.outputTokens ?? source.completionTokens);
+  const total = readNumericValue(source.total ?? source.totalTokens ?? source.tokens ?? (input != null && output != null ? input + output : undefined));
+  const contextWindow = readNumericValue(source.contextWindow ?? data.contextWindow);
+  const contextPercent = readNumericValue(source.percent ?? source.contextPercent ?? data.contextPercent);
+  return { input, output, total, contextWindow, contextPercent };
+}
+
+function readModelDisplay(data: Record<string, unknown>): string | undefined {
+  if (typeof data.model === "string") return data.model;
+  if (!data.model || typeof data.model !== "object") return undefined;
+  const model = data.model as Record<string, unknown>;
+  const id = typeof model.id === "string" ? model.id : undefined;
+  const name = typeof model.name === "string" ? model.name : undefined;
+  const provider = typeof model.provider === "string" ? model.provider : undefined;
+  if (!id && !name) return undefined;
+  return `${provider ? `${provider}/` : ""}${id || name}${id && name ? ` (${name})` : ""}`;
+}
+
+function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
+  const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
+  if (typeof raw === "number") return raw;
+  if (!Array.isArray(raw)) return undefined;
+  return raw.map((agent) => {
+    if (typeof agent === "string") return agent;
+    if (agent && typeof agent === "object") {
+      const item = agent as Record<string, unknown>;
+      return String(item.name ?? item.id ?? item.role ?? "subagent");
+    }
+    return "subagent";
+  });
+}
+
+function mergeHudState(session: SessionContext, data: Record<string, unknown>, activeTool?: string): HudState {
+  const previous = (session.hudState || {}) as HudState;
+  const next: HudState = {
+    ...previous,
+    model: readModelDisplay(data) || previous.model,
+    reasoningLevel: typeof data.thinkingLevel === "string"
+      ? data.thinkingLevel
+      : typeof data.reasoningLevel === "string"
+        ? data.reasoningLevel
+        : previous.reasoningLevel,
+    tokens: readTokenUsage(data),
+    activeSubagents: readSubagentState(data) ?? previous.activeSubagents,
+    activeTool: activeTool === undefined ? previous.activeTool : activeTool,
+    turnStatus: previous.turnStatus,
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  };
+  session.hudState = next as unknown as Record<string, unknown>;
+  return next;
+}
+
+async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
+  if (session.hudMessage) return;
+  if (session.hudInitPromise) {
+    await session.hudInitPromise;
+    return;
+  }
+  const initialization = (async () => {
+    session.toolTraces ||= new Map();
+    const initialState = (session.hudState || { cwd: session.cwd }) as HudState;
+    try {
+      const pinned = await thread.messages.fetchPinned().catch(() => null);
+      const existing = pinned?.find((message) => message.embeds.some((embed) => embed.title === "📡 OMP Live HUD"));
+      session.hudMessage = existing || await thread.send({ embeds: [formatHudEmbed(initialState)] });
+      if (!existing) await session.hudMessage.pin("OMP live observability HUD").catch(() => {});
+      session.hudLastEditTimestamp = Date.now();
+      scheduleHudUpdate(session, thread);
+    } catch (error) {
+      console.warn(`Unable to create pinned HUD for thread ${thread.id}:`, error);
+    }
+  })();
+  session.hudInitPromise = initialization;
+  try {
+    await initialization;
+  } finally {
+    if (session.hudInitPromise === initialization) session.hudInitPromise = undefined;
+  }
+}
+
+async function flushHudUpdate(session: SessionContext): Promise<void> {
+  clearTimeout(session.hudUpdateTimer);
+  session.hudUpdateTimer = undefined;
+  if (!session.hudMessage) return;
+  session.hudLastEditTimestamp = Date.now();
+  await session.hudMessage.edit({ embeds: [formatHudEmbed((session.hudState || { cwd: session.cwd }) as HudState)] }).catch(() => {});
+}
+
+function scheduleHudUpdate(session: SessionContext, thread?: ThreadChannel): void {
+  if (!session.hudMessage) {
+    if (thread) void ensurePinnedHud(session, thread);
+    return;
+  }
+  const elapsed = Date.now() - (session.hudLastEditTimestamp || 0);
+  if (elapsed >= OBSERVABILITY_UPDATE_THROTTLE_MS) {
+    void flushHudUpdate(session);
+    return;
+  }
+  if (!session.hudUpdateTimer) {
+    session.hudUpdateTimer = setTimeout(() => {
+      void flushHudUpdate(session);
+    }, OBSERVABILITY_UPDATE_THROTTLE_MS - elapsed);
   }
 }
 
@@ -235,11 +395,39 @@ function buildSlashCommands() {
           .setDescription("Initial model to use for the session")
           .setAutocomplete(true)
           .setRequired(false),
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName("worktree")
+          .setDescription("Create an isolated Git worktree for this session")
+          .setRequired(false),
       ),
 
     new SlashCommandBuilder()
       .setName("omp-terminate-all")
       .setDescription("Terminate all active OMP sessions and delete their Discord threads"),
+
+    new SlashCommandBuilder()
+      .setName("diff")
+      .setDescription("Inspect Git changes in this session workspace")
+      .addBooleanOption((opt) =>
+        opt.setName("staged").setDescription("Show staged changes instead of unstaged changes").setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName("path").setDescription("Limit the diff to a workspace path").setAutocomplete(true).setRequired(false),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("download")
+      .setDescription("Download a file from this session workspace")
+      .addStringOption((opt) =>
+        opt.setName("path").setDescription("Workspace-relative file path").setAutocomplete(true).setRequired(true),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("commit")
+      .setDescription("Commit staged or tracked workspace changes")
+      .addStringOption((opt) => opt.setName("message").setDescription("Commit message").setRequired(true)),
 
     // 2. Skill runner with rich autocomplete
     new SlashCommandBuilder()
@@ -347,18 +535,25 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 console.log("Registering Discord Slash Commands...");
 await rest.put(Routes.applicationCommands(CLIENT_ID), { body: buildSlashCommands() });
 console.log("All Discord Slash Commands registered successfully.");
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel, Partials.Message],
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
 });
 
 // Spawn OMP RPC instance for a thread
-function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: string): SessionContext {
+function createOmpSession(
+  thread: ThreadChannel,
+  cwd: string,
+  initialModel?: string,
+  metadata?: Record<string, unknown>,
+  sessionId?: string,
+  sessionFile?: string,
+): SessionContext {
   let resolveInitialState: ((state: Record<string, unknown>) => void) | undefined;
   const initialStatePromise = new Promise<Record<string, unknown>>((resolve) => {
     resolveInitialState = resolve;
@@ -366,10 +561,13 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
   });
 
   const args = ["omp", "--mode", "rpc"];
+  const resumeTarget = resolveOmpSessionPath(sessionFile, sessionId);
+  if (resumeTarget) {
+    args.push(`--resume=${resumeTarget}`);
+  }
   if (initialModel) {
     args.push(`--model=${initialModel}`);
   }
-
   const proc = spawn(args, {
     cwd,
     env: getSanitizedChildEnv(),
@@ -378,15 +576,39 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     stderr: "inherit",
   });
 
+  const metadataWorktree = metadata?.worktree;
+  const worktree =
+    metadataWorktree && typeof metadataWorktree === "object"
+      ? (() => {
+          const candidate = metadataWorktree as Record<string, unknown>;
+          if (
+            typeof candidate.path === "string" &&
+            typeof candidate.branch === "string" &&
+            typeof candidate.repoRoot === "string" &&
+            typeof candidate.gitDir === "string"
+          ) {
+            return candidate as unknown as WorktreeInfo;
+          }
+          return undefined;
+        })()
+      : undefined;
   const session: SessionContext = {
     process: proc,
     threadId: thread.id,
     cwd,
+    sessionId,
+    sessionFile: resumeTarget || sessionFile,
+    ...(worktree ? { worktree } : {}),
     currentStreamBuffer: "",
     lastEditTimestamp: 0,
     initialStatePromise,
     resolveInitialState,
+    hudState: { model: initialModel, cwd, turnStatus: "idle", updatedAt: Date.now() },
+    hudLastEditTimestamp: 0,
+    toolTraces: new Map(),
+    toolTraceHistory: [],
   };
+  void ensurePinnedHud(session, thread);
 
   const nodeStdout = Readable.fromWeb(proc.stdout as unknown as WebReadableStream);
   const readline = createInterface({
@@ -406,44 +628,37 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     }
   });
   proc.exited.then((code: number | null) => {
+    session.isRunning = false;
+    session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    clearTimeout(session.hudUpdateTimer);
+    session.hudUpdateTimer = undefined;
+    session.toolTraces?.clear();
+    session.toolTraceHistory = [];
+    session.activePromptMsg = undefined;
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
-    void sessionManager.remove(thread.id);
+    void sessionManager.terminate(session, undefined, false);
   });
   return session;
-}
-
-function cleanThreadAttachments(session: SessionContext): void {
-  try {
-    const primaryThreadDir = join(session.cwd, ".discord-attachments", session.threadId);
-    if (existsSync(primaryThreadDir)) {
-      rmSync(primaryThreadDir, { recursive: true, force: true });
-    }
-    const primaryBaseDir = join(session.cwd, ".discord-attachments");
-    if (existsSync(primaryBaseDir) && readdirSync(primaryBaseDir).length === 0) {
-      rmSync(primaryBaseDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean primary attachment directory for thread ${session.threadId}:`, err);
-  }
-
-  try {
-    const fallbackThreadDir = join(tmpdir(), "omp-discord-attachments", session.threadId);
-    if (existsSync(fallbackThreadDir)) {
-      rmSync(fallbackThreadDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean fallback attachment directory for thread ${session.threadId}:`, err);
-  }
 }
 
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
   await sessionManager.terminate(session, client, deleteThread);
 }
+
+async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
+  if (!isDefaultThreadName(thread.name)) return;
+  const nextName = buildDynamicThreadName(prompt, thread.name, "idle");
+  if (nextName === thread.name) return;
+  await thread.setName(nextName).catch((err) => {
+    console.warn(`Failed to derive a name for thread ${thread.id}:`, err);
+  });
+}
+
 /**
  * Format tool execution details into a concise, user-friendly status line.
  */
@@ -571,26 +786,35 @@ async function flushActivePromptMessage(session: SessionContext): Promise<void> 
   }
   if (!session.activePromptMsg) return;
 
-  const now = Date.now();
-  session.lastEditTimestamp = now;
+  session.lastEditTimestamp = Date.now();
 
-  let displayContent = "";
-  if (session.currentStreamBuffer) {
-    const textTail = session.currentStreamBuffer.slice(-1800);
-    if (session.activeToolStatus) {
-      displayContent = `${textTail}\n\n${session.activeToolStatus}`;
-    } else {
-      displayContent = textTail;
-    }
+  const hasTraces = session.toolTraceHistory && session.toolTraceHistory.length > 0;
+  const textTail = session.currentStreamBuffer ? session.currentStreamBuffer.slice(-1800) : "";
+
+  if (hasTraces) {
+    const embed = formatToolTracesEmbed(session.toolTraceHistory!);
+    await session.activePromptMsg
+      .edit({
+        content: textTail || null,
+        embeds: [embed],
+      })
+      .catch(() => {});
+  } else if (textTail) {
+    await session.activePromptMsg
+      .edit({
+        content: textTail,
+        embeds: [],
+      })
+      .catch(() => {});
   } else {
-    displayContent = session.activeToolStatus || "🤔 *Thinking...*";
+    const status = session.activeToolStatus || "🤔 *Thinking...*";
+    await session.activePromptMsg
+      .edit({
+        content: status,
+        embeds: [],
+      })
+      .catch(() => {});
   }
-
-  if (displayContent.length > 1950) {
-    displayContent = displayContent.slice(-1950);
-  }
-
-  await session.activePromptMsg.edit(displayContent).catch(() => {});
 }
 /**
  * Start or refresh typing indicator in Discord thread.
@@ -637,6 +861,138 @@ function scheduleActivePromptUpdate(session: SessionContext): void {
 }
 
 // Handle RPC Frames & Events
+function executionIdForEvent(event: Record<string, unknown>, toolName: string): string {
+  const candidate = event.executionId ?? event.toolExecutionId ?? event.toolCallId ?? event.callId ?? event.id;
+  return typeof candidate === "string" || typeof candidate === "number"
+    ? String(candidate)
+    : `${toolName}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function toolOutputFromEvent(event: Record<string, unknown>): unknown {
+  return event.output ?? event.result ?? event.text ?? event.content ?? event.error;
+}
+
+function toolExitCodeFromEvent(event: Record<string, unknown>): number | null | undefined {
+  const raw = event.exitCode ?? event.exit_status ?? event.code ?? (event.result && typeof event.result === "object"
+    ? (event.result as Record<string, unknown>).exitCode
+    : undefined);
+  if (raw === null) return null;
+  return readNumericValue(raw);
+}
+
+function updateHudActivity(session: SessionContext, thread: ThreadChannel, activeTool: string | undefined, turnStatus?: string): void {
+  const current = (session.hudState || { cwd: session.cwd }) as HudState;
+  session.hudState = {
+    ...current,
+    activeTool,
+    ...(turnStatus ? { turnStatus } : {}),
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  } as unknown as Record<string, unknown>;
+  scheduleHudUpdate(session, thread);
+}
+
+async function handleToolExecutionStart(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
+  const toolName = typeof event.toolName === "string"
+    ? event.toolName
+    : typeof event.tool === "string"
+      ? event.tool
+      : "tool";
+  const id = executionIdForEvent(event, toolName);
+  const trace: ToolExecutionTrace = {
+    id,
+    toolName,
+    args: event.args ?? event.input,
+    intent: typeof event.intent === "string" ? event.intent : undefined,
+    phase: "running",
+    startedAt: Date.now(),
+  };
+  session.toolTraces.set(id, trace);
+  session.toolTraceHistory.push(trace);
+  session.activeToolStatus = formatToolStatus(toolName, trace.args, trace.intent);
+  updateHudActivity(session, thread, `${toolIcon(toolName)} ${toolName}`, "running");
+  scheduleActivePromptUpdate(session);
+}
+
+async function handleToolExecutionUpdate(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
+  const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+  const id = executionIdForEvent(event, toolName);
+  let trace = session.toolTraces.get(id);
+  if (!trace) {
+    trace = {
+      id,
+      toolName,
+      phase: "running",
+      startedAt: Date.now(),
+    };
+    session.toolTraces.set(id, trace);
+    session.toolTraceHistory.push(trace);
+  }
+  trace.phase = "updated";
+  const output = formatToolOutputPreview(toolOutputFromEvent(event));
+  if (output) trace.outputPreview = output;
+  session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
+  updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
+  scheduleActivePromptUpdate(session);
+}
+
+async function handleToolExecutionEnd(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
+  const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+  const id = executionIdForEvent(event, toolName);
+  let trace = session.toolTraces.get(id);
+  if (!trace) {
+    trace = {
+      id,
+      toolName,
+      phase: "running",
+      startedAt: Date.now(),
+    };
+    session.toolTraces.set(id, trace);
+    session.toolTraceHistory.push(trace);
+  }
+  trace.endedAt = Date.now();
+  trace.durationMs = trace.endedAt - trace.startedAt;
+  trace.exitCode = toolExitCodeFromEvent(event);
+  trace.outputPreview = formatToolOutputPreview(toolOutputFromEvent(event)) || trace.outputPreview;
+  trace.error = typeof event.error === "string" ? event.error : trace.error;
+  trace.phase = trace.error || (trace.exitCode != null && trace.exitCode !== 0) ? "failed" : "completed";
+  scheduleActivePromptUpdate(session);
+  session.toolTraces.delete(id);
+  const nextRunningTrace = [...session.toolTraces.values()].reverse().find(
+    (t) => t.phase === "running" || t.phase === "updated",
+  );
+  session.activeToolStatus = nextRunningTrace
+    ? formatToolStatus(nextRunningTrace.toolName, nextRunningTrace.args, nextRunningTrace.intent)
+    : undefined;
+  updateHudActivity(
+    session,
+    thread,
+    nextRunningTrace ? `${toolIcon(nextRunningTrace.toolName)} ${nextRunningTrace.toolName}` : undefined,
+    "running",
+  );
+}
+
+
+
+function updateSubagentHud(session: SessionContext, thread: ThreadChannel, delta: number): void {
+  const current = (session.hudState || { cwd: session.cwd }) as HudState;
+  const raw = current.activeSubagents;
+  const count = typeof raw === "number" ? raw : Array.isArray(raw) ? raw.length : 0;
+  session.hudState = {
+    ...current,
+    activeSubagents: Math.max(0, count + delta),
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  } as unknown as Record<string, unknown>;
+  scheduleHudUpdate(session, thread);
+}
+
 async function handleRpcEvent(
   session: SessionContext,
   thread: ThreadChannel,
@@ -658,17 +1014,37 @@ async function handleRpcEvent(
     return;
   }
 
-  // 2. Turn Start
-  if (type === "agent_start") {
+  // 2. Fatal RPC errors
+  if (type === "error" || type === "fatal_error") {
+    session.isRunning = false;
+    session.confirmationPending = false;
+    stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+
+    const errorText = typeof event.message === "string" ? event.message : "OMP reported a fatal error.";
+    await thread.send(`🔴 **OMP error:** ${errorText}`).catch(() => {});
+    return;
+  }
+
+  // 3. Turn Start
+  if (type === "agent_start") {
+    session.isRunning = true;
+    session.completionBarAttached = false;
+    session.confirmationPending = false;
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
+    session.toolTraceHistory = [];
+    session.toolTraces = new Map();
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
     session.lastEditTimestamp = Date.now();
-    startTyping(session, thread);
+    updateHudActivity(session, thread, undefined, "running");
     return;
   }
 
@@ -691,25 +1067,30 @@ async function handleRpcEvent(
     }
     return;
   }
-
   // 4. Tool Execution Events
   if (type === "tool_execution_start") {
-    const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-    const args = (event.args || event.input || {}) as Record<string, unknown>;
-    const intent = typeof event.intent === "string" ? event.intent : undefined;
+    await handleToolExecutionStart(session, thread, event);
+    return;
+  }
 
-    session.activeToolStatus = formatToolStatus(toolName, args, intent);
-    scheduleActivePromptUpdate(session);
+  if (type === "tool_execution_update") {
+    await handleToolExecutionUpdate(session, thread, event);
     return;
   }
 
   if (type === "tool_execution_end") {
-    session.activeToolStatus = undefined;
-    scheduleActivePromptUpdate(session);
+    await handleToolExecutionEnd(session, thread, event);
     return;
   }
 
-  if (type === "turn_start" || type === "turn_end") {
+  if (type === "turn_start") {
+    updateHudActivity(session, thread, undefined, "running");
+    session.activeToolStatus = undefined;
+    return;
+  }
+
+  if (type === "turn_end") {
+    updateHudActivity(session, thread, undefined, "idle");
     session.activeToolStatus = undefined;
     return;
   }
@@ -721,6 +1102,7 @@ async function handleRpcEvent(
     const messageText = typeof event.message === "string" ? event.message : "Confirmation needed";
 
     if (method === "confirm" && id) {
+      session.confirmationPending = true;
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`approve_${id}`)
@@ -779,7 +1161,21 @@ async function handleRpcEvent(
           })
           .catch(() => {});
       }
+      session.confirmationPending = false;
     }
+    return;
+  }
+
+  if (type === "subagent_start") {
+    updateSubagentHud(session, thread, 1);
+    return;
+  }
+
+  if (type === "subagent_end" || type === "subagent_result") {
+    updateSubagentHud(session, thread, -1);
+    return;
+  }
+  if (type === "subagent_update") {
     return;
   }
 
@@ -808,10 +1204,31 @@ async function handleRpcEvent(
   // 7. Response frames (e.g. state / custom query results)
   if (type === "response" && event.command === "get_state" && event.data && typeof event.data === "object") {
     const data = event.data as Record<string, unknown>;
+    if (typeof data.sessionId === "string" && data.sessionId) {
+      session.sessionId = data.sessionId;
+    }
+    if (typeof data.sessionFile === "string" && data.sessionFile) {
+      session.sessionFile = data.sessionFile;
+    }
+    if (session.sessionId || session.sessionFile) {
+      void sessionManager.update(session.threadId, {
+        sessionId: session.sessionId,
+        sessionFile: session.sessionFile,
+      }).catch((err) => {
+        console.error(`Failed to update session binding info for thread ${session.threadId}:`, err);
+      });
+    }
+
     if (session.resolveInitialState) {
       session.resolveInitialState(data);
       session.resolveInitialState = undefined;
     }
+    const gitSnapshot = await getGitSnapshot(session.cwd);
+    const hud = mergeHudState(session, data);
+    hud.branch = gitSnapshot.branch || undefined;
+    hud.gitDirty = gitSnapshot.dirty === null ? undefined : gitSnapshot.dirty;
+    session.hudState = hud as unknown as Record<string, unknown>;
+    scheduleHudUpdate(session, thread);
 
     if (event.id === "status_req") {
       const model = data.model as { provider?: string; id?: string; name?: string } | undefined;
@@ -820,7 +1237,7 @@ async function handleRpcEvent(
 
       const [advisorConfig, branch] = await Promise.all([
         getAdvisorConfig(session.cwd),
-        getGitBranch(session.cwd),
+        Promise.resolve(gitSnapshot.branch),
       ]);
 
       const advisorText = advisorConfig.enabled
@@ -853,44 +1270,88 @@ async function handleRpcEvent(
 
   // 8. Turn Finish
   if (type === "agent_end") {
+    session.isRunning = false;
+    session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    const components = [buildQuickActionRow(session.threadId)];
+    const full = session.currentStreamBuffer.trim();
+    const responseText = full || "✅ *Completed.*";
+    const chunks = splitDiscordMessage(responseText, 1950);
 
     if (session.activePromptMsg) {
-      const full = session.currentStreamBuffer.trim();
-      if (full) {
-        const chunks = splitDiscordMessage(full, 1950);
-        await session.activePromptMsg.edit(chunks[0]).catch(() => {});
-        for (let i = 1; i < chunks.length; i++) {
-          await thread.send(chunks[i]).catch(() => {});
-        }
-      } else {
-        await session.activePromptMsg.edit("✅ *Completed.*").catch(() => {});
+      await session.activePromptMsg
+        .edit({ content: chunks[0], embeds: [], components })
+        .catch(() => {});
+      for (let i = 1; i < chunks.length; i++) {
+        await thread.send(chunks[i]).catch(() => {});
+      }
+    } else {
+      await thread.send({ content: chunks[0], components }).catch(() => {});
+      for (let i = 1; i < chunks.length; i++) {
+        await thread.send(chunks[i]).catch(() => {});
       }
     }
 
+    session.completionBarAttached = true;
+    const gitSnapshot = await getGitSnapshot(session.cwd);
+    const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
+    session.hudState = {
+      ...currentHud,
+      branch: gitSnapshot.branch || undefined,
+      gitDirty: gitSnapshot.dirty === null ? undefined : gitSnapshot.dirty,
+      updatedAt: Date.now(),
+    } as unknown as Record<string, unknown>;
     session.activePromptMsg = undefined;
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
+    updateHudActivity(session, thread, undefined, "idle");
     return;
   }
 
-  // 9. Prompt Result without agent turn (Local command completion)
-  if (type === "prompt_result" && event.agentInvoked === false) {
+  // 9. Prompt Result, including local command completion without agent_end.
+  if (type === "prompt_result") {
+    session.isRunning = false;
+    session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    if (session.activePromptMsg) {
-      await session.activePromptMsg.delete().catch(() => {});
-      session.activePromptMsg = undefined;
+    const shouldAttachActionBar = !session.completionBarAttached || event.agentInvoked === false;
+    if (shouldAttachActionBar) {
+      const resultText = typeof event.result === "string"
+        ? event.result.trim()
+        : typeof event.message === "string"
+          ? event.message.trim()
+          : "";
+      const summary = resultText || "✅ *Completed.*";
+      const chunks = splitDiscordMessage(summary, 1950);
+      const components = [buildQuickActionRow(session.threadId)];
+
+      if (session.activePromptMsg) {
+        await session.activePromptMsg
+          .edit({ content: chunks[0], embeds: [], components })
+          .catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await thread.send(chunks[i]).catch(() => {});
+        }
+        session.activePromptMsg = undefined;
+      } else {
+        await thread.send({ content: chunks[0], components }).catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await thread.send(chunks[i]).catch(() => {});
+        }
+      }
+      session.completionBarAttached = true;
     }
+
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
+    updateHudActivity(session, thread, undefined, "idle");
   }
 }
 
@@ -1004,7 +1465,24 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
     }
   }
 
-  // Skill autocomplete
+  if ((interaction.commandName === "download" || interaction.commandName === "diff") && focused.name === "path") {
+    const session = sessionManager.get(interaction.channelId);
+    if (!session) {
+      await interaction.respond([]);
+      return;
+    }
+    const query = String(focused.value);
+    const suggestions = listWorkspaceFiles(session.cwd, query)
+      .filter((file) => interaction.commandName === "diff" || isDownloadableWorkspaceFile(file))
+      .slice(0, 25)
+      .map((file) => ({
+        name: `${file.relativePath} (${file.size} bytes)`.slice(0, 100),
+        value: file.relativePath.slice(0, 100),
+      }));
+    await interaction.respond(suggestions);
+    return;
+  }
+
   if (interaction.commandName === "skill" && focused.name === "name") {
     const query = focused.value.toLowerCase();
     const filtered = OMX_SKILLS
@@ -1040,6 +1518,57 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
   }
 }
 
+async function handleQuickAction(interaction: ButtonInteraction): Promise<void> {
+  const parsed = parseQuickActionId(interaction.customId);
+  if (!parsed || parsed.threadId !== interaction.channelId) {
+    await interaction.reply({ content: "⚠️ This action is not valid in this thread.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const session = sessionManager.get(parsed.threadId);
+  if (!session) {
+    await interaction.reply({ content: "⚠️ This OMP session is no longer active.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const debounceKey = `${interaction.user.id}:${interaction.customId}`;
+  const now = Date.now();
+  const lastUsedAt = quickActionLastUsedAt.get(debounceKey) || 0;
+  if (now - lastUsedAt < QUICK_ACTION_DEBOUNCE_MS) {
+    await interaction.reply({ content: "⏳ Please wait a moment before using that action again.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  quickActionLastUsedAt.set(debounceKey, now);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    switch (parsed.action) {
+      case "undo":
+        sendRpc(session, { id: `undo_${Date.now()}`, type: "prompt", message: "/undo" });
+        await interaction.editReply("↩️ Undo requested.");
+        break;
+      case "compact":
+        sendRpc(session, { id: `compact_${Date.now()}`, type: "compact" });
+        await interaction.editReply("🗜️ Context compaction triggered.");
+        break;
+      case "abort":
+        if (session.isRunning === false) {
+          await interaction.editReply("ℹ️ No active turn to abort.");
+          break;
+        }
+        sendRpc(session, { id: `abort_${Date.now()}`, type: "abort" });
+        await interaction.editReply("⏹️ Turn abort requested.");
+        break;
+      case "status":
+        sendRpc(session, { id: "status_req", type: "get_state" });
+        await interaction.editReply("📊 Status requested in this thread.");
+        break;
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await interaction.editReply(`❌ Action failed: ${message}`).catch(() => {});
+  }
+}
 
 // Handle Slash Command Executions
 client.on("interactionCreate", async (interaction) => {
@@ -1062,6 +1591,11 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.isButton()) {
+    await handleQuickAction(interaction);
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   // New Session
@@ -1079,6 +1613,7 @@ client.on("interactionCreate", async (interaction) => {
     const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
     const inputDir = interaction.options.getString("directory");
     const inputModel = interaction.options.getString("model");
+    const useWorktree = interaction.options.getBoolean("worktree") ?? false;
     const rawCwd = inputDir || rootDir;
     const expandedRawCwd = rawCwd.startsWith("~")
       ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
@@ -1101,12 +1636,11 @@ client.on("interactionCreate", async (interaction) => {
       });
       return;
     }
-    const dirName = basename(cwd) || "workspace";
     const sessionId = Math.random().toString(36).slice(2, 8);
-    const threadName = `${dirName} (${sessionId})`.slice(0, 100);
-
+    const threadName = `omp-session-${sessionId}`;
     await interaction.deferReply();
 
+    let createdWorktree: WorktreeInfo | undefined;
     try {
       const createPrivateThreads = process.env.CREATE_PRIVATE_THREADS !== "false";
       let thread: ThreadChannel;
@@ -1131,19 +1665,36 @@ client.on("interactionCreate", async (interaction) => {
           autoArchiveDuration: 1440,
         });
       }
-      const session = createOmpSession(thread, cwd, inputModel || undefined);
+
+      let sessionCwd = cwd;
+      if (useWorktree) {
+        const worktreeResult = await createGitWorktree(cwd, thread.id);
+        if (!worktreeResult.ok || !worktreeResult.worktree) {
+          throw new Error(worktreeResult.error || "Unable to create an isolated Git worktree.");
+        }
+        createdWorktree = worktreeResult.worktree;
+        sessionCwd = createdWorktree.path;
+      }
+      const session = createOmpSession(
+        thread,
+        sessionCwd,
+        inputModel || undefined,
+        createdWorktree ? { worktree: createdWorktree } : undefined,
+      );
       await sessionManager.register(session, {
         initialModel: inputModel || undefined,
         metadata: {
           guildId: thread.guildId,
           parentChannelId: thread.parentId,
           createdById: interaction.user.id,
+          ...(createdWorktree ? { worktree: createdWorktree } : {}),
         },
       });
+      await ensurePinnedHud(session, thread);
       const [state, advisorConfig, branch] = await Promise.all([
         session.initialStatePromise,
-        getAdvisorConfig(cwd),
-        getGitBranch(cwd),
+        getAdvisorConfig(sessionCwd),
+        getGitBranch(sessionCwd),
       ]);
 
       const modelData = (state?.model as { id?: string; name?: string; provider?: string } | undefined) || {};
@@ -1170,19 +1721,21 @@ client.on("interactionCreate", async (interaction) => {
           { name: "🤖 Active Model", value: `\`${modelDisplay}\``, inline: true },
           { name: "🛡️ Advisor", value: advisorText, inline: true },
           { name: "🌿 Git Branch", value: branchText, inline: true },
-          { name: "📁 Working Directory", value: `\`${cwd}\``, inline: false },
-          { name: "🧠 Thinking Level", value: `\`${thinkingLevel}\``, inline: true },
+          { name: "📁 Working Directory", value: `\`${sessionCwd}\``, inline: false },
           { name: "⚡ Fast Mode", value: fastMode ? "⚡ Active" : "Off", inline: true },
         )
         .setTimestamp();
 
       await interaction.editReply(
-        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\`\n🤖 Model: \`${modelDisplay}\``,
+        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${sessionCwd}\`${createdWorktree ? `\n🌿 Isolated branch: \`${createdWorktree.branch}\`` : ""}\n🤖 Model: \`${modelDisplay}\``,
       );
       await thread.send({
         embeds: [sessionEmbed],
       });
     } catch (err) {
+      if (createdWorktree) {
+        await removeGitWorktree(createdWorktree);
+      }
       const errorMsg = err instanceof Error ? err.message : String(err);
       await interaction.editReply(`Failed to start session: ${errorMsg}`);
     }
@@ -1224,7 +1777,94 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // /skill [name] [prompt]
+  // /diff [staged] [path]
+  if (interaction.commandName === "diff") {
+    const staged = interaction.options.getBoolean("staged") ?? false;
+    const pathFilter = interaction.options.getString("path") || undefined;
+    const result = await inspectGitDiff(session.cwd, { staged, path: pathFilter });
+    if (result.error) {
+      await interaction.reply(`❌ ${result.error}`);
+      return;
+    }
+    const scope = result.path ? ` for \`${result.path}\`` : "";
+    if (!result.hasChanges) {
+      await interaction.reply(`ℹ️ No ${staged ? "staged" : "unstaged"} changes${scope} found in this workspace.`);
+      return;
+    }
+    const summaryEmbed = new EmbedBuilder()
+      .setTitle(`${staged ? "Staged" : "Unstaged"} Git Changes`)
+      .setColor(0x2f80ed)
+      .addFields(
+        { name: "Summary", value: result.summary || "Changed files detected.", inline: false },
+        ...(result.stat.trim() ? [{ name: "Diff stat", value: `\`\`\`\n${result.stat.trim().slice(0, 900)}\n\`\`\``, inline: false }] : []),
+      )
+      .setTimestamp();
+    if (!result.hasDiff) {
+      await interaction.reply({
+        content: `ℹ️ Git reports changes${scope}, but there is no ${staged ? "staged" : "unstaged"} patch to display (for example, an untracked file).`,
+        embeds: [summaryEmbed],
+      });
+      return;
+    }
+    const formatted = formatDiffForDiscord(result.diff);
+    if (formatted.inline) {
+      await interaction.reply({ content: formatted.content, embeds: [summaryEmbed] });
+    } else {
+      await interaction.reply({
+        content: "📎 The diff is too large for a Discord message; the complete patch is attached.",
+        embeds: [summaryEmbed],
+        files: [{ attachment: formatted.attachment!, name: formatted.filename! }],
+      });
+    }
+    return;
+  }
+
+  // /download [path]
+  if (interaction.commandName === "download") {
+    const requestedPath = interaction.options.getString("path", true);
+    const result = resolveWorkspaceFile(session.cwd, requestedPath);
+    if (!result.ok || !result.file) {
+      await interaction.reply({ content: `❌ ${result.error || "Unable to resolve that file."}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!isDownloadableWorkspaceFile(result.file)) {
+      await interaction.reply({
+        content: `❌ That file is ${Math.ceil(result.file.size / (1024 * 1024))}MB, which exceeds Discord's 25MB attachment limit.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    try {
+      const contents = readFileSync(result.file.absolutePath);
+      if (contents.byteLength > MAX_WORKSPACE_DOWNLOAD_BYTES) {
+        await interaction.reply({ content: "❌ The file grew beyond Discord's 25MB attachment limit while it was being read.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.reply({
+        content: `📎 Downloading \`${result.file.relativePath}\` (${contents.byteLength} bytes).`,
+        files: [{ attachment: contents, name: basename(result.file.relativePath) }],
+      });
+    } catch {
+      await interaction.reply({ content: "❌ Unable to read that file from the session workspace.", flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  // /commit [message]
+  if (interaction.commandName === "commit") {
+    const message = interaction.options.getString("message", true);
+    await interaction.deferReply();
+    const result = await commitWorkspaceChanges(session.cwd, message);
+    if (result.error) {
+      await interaction.editReply(`❌ ${result.error}`);
+    } else if (!result.committed) {
+      await interaction.editReply("ℹ️ There are no staged or tracked changes to commit.");
+    } else {
+      await interaction.editReply(`✅ Committed workspace changes${result.hash ? ` as \`${result.hash}\`` : ""}.`);
+    }
+    return;
+  }
+
   if (interaction.commandName === "skill") {
     const skillName = interaction.options.getString("name", true);
     const prompt = interaction.options.getString("prompt", true);
@@ -1487,12 +2127,45 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  session.lastPrompt = message.content.trim() || "Attachment";
+  if (message.channel.isThread()) {
+    await updateThreadNameFromPrompt(message.channel, session.lastPrompt);
+  }
+
+
   sendRpc(session, {
     id: `prompt_${Date.now()}`,
     type: "prompt",
     message: text,
     ...(images.length > 0 ? { images } : {}),
   });
+});
+
+// Handle Message Reaction Shortcuts
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot || !isUserAllowed(user.id)) return;
+
+  const resolvedReaction = reaction.partial ? await reaction.fetch().catch(() => null) : reaction;
+  if (!resolvedReaction) return;
+  const shortcut = parseReactionShortcut(resolvedReaction.emoji.name);
+  if (!shortcut) return;
+
+  const channel = resolvedReaction.message.channel;
+  if (!channel.isThread()) return;
+  const session = sessionManager.get(channel.id);
+  if (!session) return;
+
+  if (shortcut === "abort") {
+    if (session.isRunning === false) {
+      await channel.send("ℹ️ No active turn to abort.").catch(() => {});
+      return;
+    }
+    sendRpc(session, { id: `reaction_abort_${Date.now()}`, type: "abort" });
+    await channel.send(`⏹️ Turn abort requested by <@${user.id}>.`).catch(() => {});
+  } else {
+    sendRpc(session, { id: `reaction_undo_${Date.now()}`, type: "prompt", message: "/undo" });
+    await channel.send(`↩️ Undo requested by <@${user.id}>.`).catch(() => {});
+  }
 });
 
 // Handle Thread Deletions to clean up OMP processes automatically

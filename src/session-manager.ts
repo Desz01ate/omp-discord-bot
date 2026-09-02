@@ -1,17 +1,21 @@
 import type { Client, ThreadChannel, Message } from "discord.js";
 import { existsSync, rmSync, readdirSync } from "fs";
 import { join } from "path";
-import { tmpdir } from "os";
+import { tmpdir, homedir } from "os";
 import type { Subprocess } from "bun";
 import type { SessionStore, SessionBinding } from "./storage";
 import { createSessionStore } from "./storage";
-
+import { removeGitWorktree, type WorktreeInfo } from "./workspace";
+import type { ToolExecutionTrace } from "./observability";
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 export interface SessionContext {
   process: OmpProcess;
   threadId: string;
   cwd: string;
+  sessionId?: string;
+  sessionFile?: string;
+  worktree?: WorktreeInfo;
   activePromptMsg?: Message;
   currentStreamBuffer: string;
   lastEditTimestamp: number;
@@ -20,10 +24,86 @@ export interface SessionContext {
   typingTimer?: Timer;
   initialStatePromise?: Promise<Record<string, unknown>>;
   resolveInitialState?: (state: Record<string, unknown>) => void;
+  /** True after agent_start and cleared when the turn completes. */
+  isRunning?: boolean;
+  /** Last user prompt, used for thread naming and UI context. */
+  lastPrompt?: string;
+  /** True while an extension confirmation is waiting for a Discord response. */
+  confirmationPending?: boolean;
+  /** Prevents a trailing prompt_result from duplicating the agent_end action bar. */
+  completionBarAttached?: boolean;
+  /** Pinned live dashboard message and its throttled update state. */
+  hudMessage?: Message;
+  hudUpdateTimer?: Timer;
+  hudInitPromise?: Promise<void>;
+  hudLastEditTimestamp?: number;
+  hudState?: Record<string, unknown>;
+  toolTraceHistory?: ToolExecutionTrace[];
+  /** Active tool traces keyed by the RPC execution/call id. */
+  toolTraces?: Map<string, ToolExecutionTrace>;
 }
-
 export interface SessionManagerOptions {
   store?: SessionStore;
+}
+
+export function resolveOmpSessionPath(sessionFile?: string, sessionId?: string): string | undefined {
+  if (sessionFile && existsSync(sessionFile)) {
+    return sessionFile;
+  }
+  if (sessionId) {
+    const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+    const sessionsRoot = join(agentDir, "sessions");
+    if (existsSync(sessionsRoot)) {
+      try {
+        const subdirs = readdirSync(sessionsRoot);
+        for (const subdir of subdirs) {
+          const fullSubdir = join(sessionsRoot, subdir);
+          try {
+            const files = readdirSync(fullSubdir);
+            for (const file of files) {
+              if (file.endsWith(".jsonl") && file.includes(sessionId)) {
+                return join(fullSubdir, file);
+              }
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+  return undefined;
+}
+
+export function cleanOmpSessionFiles(sessionFile?: string, sessionId?: string): void {
+  try {
+    if (sessionFile && existsSync(sessionFile)) {
+      rmSync(sessionFile, { force: true });
+      const dirPath = sessionFile.endsWith(".jsonl") ? sessionFile.slice(0, -6) : "";
+      if (dirPath && existsSync(dirPath)) {
+        rmSync(dirPath, { recursive: true, force: true });
+      }
+    }
+    if (sessionId) {
+      const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+      const sessionsRoot = join(agentDir, "sessions");
+      if (existsSync(sessionsRoot)) {
+        const subdirs = readdirSync(sessionsRoot);
+        for (const subdir of subdirs) {
+          const fullSubdir = join(sessionsRoot, subdir);
+          try {
+            const files = readdirSync(fullSubdir);
+            for (const file of files) {
+              if (file.includes(sessionId)) {
+                const targetPath = join(fullSubdir, file);
+                rmSync(targetPath, { recursive: true, force: true });
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error cleaning OMP session files:", err);
+  }
 }
 
 export function cleanThreadAttachments(cwd: string, threadId: string): void {
@@ -49,7 +129,6 @@ export function cleanThreadAttachments(cwd: string, threadId: string): void {
     console.error(`Failed to clean fallback attachment directory for thread ${threadId}:`, err);
   }
 }
-
 /**
  * Stop typing indicator in Discord thread.
  */
@@ -102,6 +181,8 @@ export class SessionManager {
     session: SessionContext,
     options: {
       initialModel?: string;
+      sessionId?: string;
+      sessionFile?: string;
       metadata?: Record<string, unknown>;
     } = {},
   ): Promise<void> {
@@ -110,11 +191,43 @@ export class SessionManager {
       threadId: session.threadId,
       cwd: session.cwd,
       initialModel: options.initialModel,
+      sessionId: options.sessionId ?? session.sessionId,
+      sessionFile: options.sessionFile ?? session.sessionFile,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      metadata: options.metadata,
+      metadata: {
+        ...options.metadata,
+        ...(session.worktree ? { worktree: session.worktree } : {}),
+      },
     };
     await this.store.set(binding);
+  }
+
+  /**
+   * Updates mutable fields on an active session and persists changes to storage.
+   */
+  public async update(
+    threadId: string,
+    updates: Partial<Omit<SessionBinding, "threadId" | "createdAt">>,
+  ): Promise<void> {
+    const session = this.activeSessions.get(threadId);
+    if (session) {
+      if (updates.sessionId !== undefined) session.sessionId = updates.sessionId;
+      if (updates.sessionFile !== undefined) session.sessionFile = updates.sessionFile;
+    }
+    const existing = await this.store.get(threadId);
+    if (existing) {
+      const updated: SessionBinding = {
+        ...existing,
+        ...updates,
+        updatedAt: Date.now(),
+        metadata: {
+          ...existing.metadata,
+          ...updates.metadata,
+        },
+      };
+      await this.store.set(updated);
+    }
   }
 
   /**
@@ -129,7 +242,7 @@ export class SessionManager {
 
   /**
    * Full session termination: stops typing/timers, kills subprocess, cleans attachments, removes from memory and store,
-   * and optionally deletes Discord thread channel.
+   * removes a bot-created Git worktree, and optionally deletes Discord thread channel.
    */
   public async terminate(
     sessionOrThreadId: SessionContext | string,
@@ -138,6 +251,10 @@ export class SessionManager {
   ): Promise<void> {
     const threadId = typeof sessionOrThreadId === "string" ? sessionOrThreadId : sessionOrThreadId.threadId;
     const session = typeof sessionOrThreadId === "string" ? this.activeSessions.get(threadId) : sessionOrThreadId;
+    const binding = await this.store.get(threadId).catch(() => null);
+
+    const sessionFile = session?.sessionFile || binding?.sessionFile;
+    const sessionId = session?.sessionId || binding?.sessionId;
 
     if (session) {
       stopTyping(session);
@@ -145,12 +262,25 @@ export class SessionManager {
         clearTimeout(session.editTimer);
         session.editTimer = undefined;
       }
+      if (session.hudUpdateTimer) {
+        clearTimeout(session.hudUpdateTimer);
+        session.hudUpdateTimer = undefined;
+      }
+      session.toolTraces?.clear();
+      session.toolTraceHistory = [];
       try {
         session.process.kill();
       } catch (err) {
         console.error(`Error terminating OMP process for thread ${session.threadId}:`, err);
       }
       cleanThreadAttachments(session.cwd, session.threadId);
+      if (session.worktree) {
+        await removeGitWorktree(session.worktree);
+      }
+    }
+
+    if (sessionFile || sessionId) {
+      cleanOmpSessionFiles(sessionFile, sessionId);
     }
 
     if (deleteThread && client) {
@@ -188,7 +318,14 @@ export class SessionManager {
    */
   public async restoreAll(
     client: Client,
-    spawnSession: (thread: ThreadChannel, cwd: string, initialModel?: string) => SessionContext,
+    spawnSession: (
+      thread: ThreadChannel,
+      cwd: string,
+      initialModel?: string,
+      metadata?: Record<string, unknown>,
+      sessionId?: string,
+      sessionFile?: string,
+    ) => SessionContext,
   ): Promise<number> {
     const bindings = await this.store.list();
     if (bindings.length === 0) {
@@ -203,6 +340,14 @@ export class SessionManager {
       try {
         if (!existsSync(binding.cwd)) {
           console.warn(`⚠️ Working directory for thread ${binding.threadId} no longer exists (${binding.cwd}). Cleaning up.`);
+          const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
+          if (worktree) {
+            await removeGitWorktree(worktree).catch((err) => {
+              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+            });
+          }
+          cleanThreadAttachments(binding.cwd, binding.threadId);
+          cleanOmpSessionFiles(binding.sessionFile, binding.sessionId);
           await this.store.delete(binding.threadId);
           continue;
         }
@@ -213,6 +358,14 @@ export class SessionManager {
 
         if (!channel || !channel.isThread()) {
           console.warn(`⚠️ Discord thread ${binding.threadId} is no longer accessible. Cleaning up.`);
+          const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
+          if (worktree) {
+            await removeGitWorktree(worktree).catch((err) => {
+              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+            });
+          }
+          cleanThreadAttachments(binding.cwd, binding.threadId);
+          cleanOmpSessionFiles(binding.sessionFile, binding.sessionId);
           await this.store.delete(binding.threadId);
           continue;
         }
@@ -226,7 +379,16 @@ export class SessionManager {
           continue;
         }
 
-        const session = spawnSession(channel, binding.cwd, binding.initialModel);
+        const session = spawnSession(
+          channel,
+          binding.cwd,
+          binding.initialModel,
+          binding.metadata,
+          binding.sessionId,
+          binding.sessionFile,
+        );
+        if (binding.sessionId && !session.sessionId) session.sessionId = binding.sessionId;
+        if (binding.sessionFile && !session.sessionFile) session.sessionFile = binding.sessionFile;
         this.activeSessions.set(channel.id, session);
         restoredCount++;
         console.log(`✅ Restored active OMP session for thread ${channel.id} ("${channel.name}") in ${binding.cwd}`);

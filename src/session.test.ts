@@ -13,6 +13,8 @@ interface MockSession {
   process: MockProcess;
   threadId: string;
   cwd: string;
+  sessionId?: string;
+  sessionFile?: string;
   editTimer?: Timer;
   typingTimer?: Timer;
 }
@@ -225,6 +227,8 @@ describe("Session Termination and Persistence", () => {
       threadId: "live_thread_1",
       cwd: projectDir1,
       initialModel: "gpt-5.2",
+      sessionId: "session-uuid-1",
+      sessionFile: "/root/.omp/agent/sessions/sess1.jsonl",
       createdAt: 1000,
       updatedAt: 1000,
     });
@@ -280,14 +284,15 @@ describe("Session Termination and Persistence", () => {
       }
       const { session } = createMockSession(binding.threadId);
       session.cwd = binding.cwd;
+      session.sessionId = binding.sessionId;
+      session.sessionFile = binding.sessionFile;
       restoredSessions.set(binding.threadId, session);
     }
-
     expect(restoredSessions.size).toBe(1);
     expect(restoredSessions.has("live_thread_1")).toBe(true);
     expect(restoredSessions.get("live_thread_1")?.cwd).toBe(projectDir1);
-
-    // Verify deleted_thread_2 was cleaned up from the store
+    expect(restoredSessions.get("live_thread_1")?.sessionId).toBe("session-uuid-1");
+    expect(restoredSessions.get("live_thread_1")?.sessionFile).toBe("/root/.omp/agent/sessions/sess1.jsonl");
     const updatedBindings = await store2.list();
     expect(updatedBindings.length).toBe(1);
     expect(updatedBindings[0].threadId).toBe("live_thread_1");

@@ -5,6 +5,10 @@ export interface SessionBinding {
   cwd: string;
   /** Initial or selected model identifier */
   initialModel?: string;
+  /** Underlying OMP session identifier */
+  sessionId?: string;
+  /** Underlying OMP session file path (.jsonl) */
+  sessionFile?: string;
   /** Timestamp (epoch ms) when the session binding was created */
   createdAt: number;
   /** Timestamp (epoch ms) when the session binding was last updated */

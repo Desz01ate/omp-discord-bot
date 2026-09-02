@@ -5,10 +5,13 @@ import { tmpdir } from "os";
 import type { Client, ThreadChannel } from "discord.js";
 import {
   SessionManager,
+  cleanOmpSessionFiles,
+  resolveOmpSessionPath,
   type SessionContext,
   type OmpProcess,
 } from "./session-manager";
 import { SqliteSessionStore } from "./storage";
+import { createGitWorktree } from "./workspace";
 
 interface MockThread {
   id: string;
@@ -225,9 +228,16 @@ describe("SessionManager Composite Service", () => {
       },
     } as unknown as Client;
 
-    const spawnCalls: Array<{ threadId: string; cwd: string; model?: string }> = [];
-    const spawnSession = (thread: ThreadChannel, cwd: string, initialModel?: string): SessionContext => {
-      spawnCalls.push({ threadId: thread.id, cwd, model: initialModel });
+    const spawnCalls: Array<{ threadId: string; cwd: string; model?: string; sessionId?: string; sessionFile?: string }> = [];
+    const spawnSession = (
+      thread: ThreadChannel,
+      cwd: string,
+      initialModel?: string,
+      metadata?: Record<string, unknown>,
+      sessionId?: string,
+      sessionFile?: string,
+    ): SessionContext => {
+      spawnCalls.push({ threadId: thread.id, cwd, model: initialModel, sessionId, sessionFile });
       const { session } = createMockSessionContext(thread.id, cwd);
       return session;
     };
@@ -246,6 +256,175 @@ describe("SessionManager Composite Service", () => {
     const remainingStore = await store.list();
     expect(remainingStore.length).toBe(1);
     expect(remainingStore[0].threadId).toBe("live_thread");
+
+    await manager.close();
+  });
+
+  it("cleans up orphaned worktree when restored thread is inaccessible", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    await store.init();
+
+    const repoRoot = join(testDir, "worktree-repo");
+    mkdirSync(repoRoot, { recursive: true });
+    const gitProc = Bun.spawnSync(["git", "init", "-q"], { cwd: repoRoot });
+    expect(gitProc.exitCode).toBe(0);
+    writeFileSync(join(repoRoot, "init.txt"), "init\n");
+    Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "add", "init.txt"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "commit", "-qm", "init"], { cwd: repoRoot });
+
+    const worktreeResult = await createGitWorktree(repoRoot, "orphaned_thread");
+    expect(worktreeResult.ok).toBe(true);
+    const worktree = worktreeResult.worktree!;
+    const worktreePath = worktree.path;
+
+    await store.set({
+      threadId: "orphaned_thread",
+      cwd: worktreePath,
+      createdAt: 1000,
+      updatedAt: 1000,
+      metadata: { worktree },
+    });
+
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const mockClient = {
+      channels: {
+        cache: new Map<string, unknown>(),
+        fetch: async () => null,
+      },
+    } as unknown as Client;
+
+    const restoredCount = await manager.restoreAll(mockClient, () => {
+      throw new Error("Should not spawn");
+    });
+
+    expect(restoredCount).toBe(0);
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(await store.get("orphaned_thread")).toBeNull();
+
+    await manager.close();
+  });
+
+  it("resolves OMP session paths and cleans up session files and companion directories", () => {
+    const ompSessionFile = join(testDir, "test_session_123.jsonl");
+    const companionDir = join(testDir, "test_session_123");
+    writeFileSync(ompSessionFile, '{"type":"session","id":"uuid-123"}\n');
+    mkdirSync(companionDir, { recursive: true });
+    writeFileSync(join(companionDir, "log.txt"), "log data");
+
+    expect(existsSync(ompSessionFile)).toBe(true);
+    expect(existsSync(companionDir)).toBe(true);
+
+    const resolved = resolveOmpSessionPath(ompSessionFile, "uuid-123");
+    expect(resolved).toBe(ompSessionFile);
+
+    cleanOmpSessionFiles(ompSessionFile, "uuid-123");
+    expect(existsSync(ompSessionFile)).toBe(false);
+    expect(existsSync(companionDir)).toBe(false);
+  });
+
+  it("updates active session and persistent store bindings with sessionId and sessionFile", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const { session } = createMockSessionContext("t_update");
+    await manager.register(session);
+
+    expect(session.sessionId).toBeUndefined();
+    expect(session.sessionFile).toBeUndefined();
+
+    await manager.update("t_update", {
+      sessionId: "omp-uuid-456",
+      sessionFile: "/path/to/omp-456.jsonl",
+    });
+
+    expect(session.sessionId).toBe("omp-uuid-456");
+    expect(session.sessionFile).toBe("/path/to/omp-456.jsonl");
+
+    const stored = await store.get("t_update");
+    expect(stored?.sessionId).toBe("omp-uuid-456");
+    expect(stored?.sessionFile).toBe("/path/to/omp-456.jsonl");
+
+    await manager.close();
+  });
+
+  it("terminates a session and cleans up its OMP session files on disk", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const sessionFile = join(testDir, "to_terminate.jsonl");
+    writeFileSync(sessionFile, '{"type":"session","id":"to_terminate_uuid"}\n');
+
+    const { session } = createMockSessionContext("t_term_omp");
+    session.sessionFile = sessionFile;
+    session.sessionId = "to_terminate_uuid";
+    await manager.register(session);
+
+    expect(existsSync(sessionFile)).toBe(true);
+
+    await manager.terminate(session, undefined, false);
+
+    expect(existsSync(sessionFile)).toBe(false);
+    expect(manager.has("t_term_omp")).toBe(false);
+    expect(await store.get("t_term_omp")).toBeNull();
+
+    await manager.close();
+  });
+
+  it("restores active sessions with sessionId and sessionFile and passes them to spawnSession", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    await store.init();
+
+    const proj = join(testDir, "proj_restore");
+    mkdirSync(proj, { recursive: true });
+    const sessFile = join(testDir, "restored.jsonl");
+    writeFileSync(sessFile, '{"type":"session"}\n');
+
+    await store.set({
+      threadId: "t_resume_thread",
+      cwd: proj,
+      initialModel: "claude-3-7-sonnet",
+      sessionId: "saved-sess-uuid",
+      sessionFile: sessFile,
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const thread = createMockThread("t_resume_thread");
+    const mockClient = {
+      channels: {
+        cache: new Map<string, unknown>([["t_resume_thread", thread]]),
+        fetch: async () => thread,
+      },
+    } as unknown as Client;
+
+    let receivedSessionId: string | undefined;
+    let receivedSessionFile: string | undefined;
+
+    await manager.restoreAll(
+      mockClient,
+      (t, cwd, model, metadata, sId, sFile) => {
+        receivedSessionId = sId;
+        receivedSessionFile = sFile;
+        const { session } = createMockSessionContext(t.id, cwd);
+        return session;
+      },
+    );
+
+    expect(receivedSessionId).toBe("saved-sess-uuid");
+    expect(receivedSessionFile).toBe(sessFile);
+
+    const restoredSession = manager.get("t_resume_thread");
+    expect(restoredSession?.sessionId).toBe("saved-sess-uuid");
+    expect(restoredSession?.sessionFile).toBe(sessFile);
 
     await manager.close();
   });

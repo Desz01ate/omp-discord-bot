@@ -14,6 +14,8 @@ interface RawSqliteRow {
   thread_id: string;
   cwd: string;
   initial_model: string | null;
+  session_id: string | null;
+  session_file: string | null;
   created_at: number;
   updated_at: number;
   metadata: string | null;
@@ -28,7 +30,7 @@ export class SqliteSessionStore implements SessionStore {
   private getStmt: Statement<RawSqliteRow, [string]> | null = null;
   private setStmt: Statement<
     void,
-    [string, string, string | null, number, number, string | null]
+    [string, string, string | null, string | null, string | null, number, number, string | null]
   > | null = null;
   private deleteStmt: Statement<void, [string]> | null = null;
   private listStmt: Statement<RawSqliteRow, []> | null = null;
@@ -66,26 +68,38 @@ export class SqliteSessionStore implements SessionStore {
         thread_id TEXT PRIMARY KEY,
         cwd TEXT NOT NULL,
         initial_model TEXT,
+        session_id TEXT,
+        session_file TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         metadata TEXT
       );
     `);
 
+    // Safe column migrations for existing databases
+    try {
+      this.db.exec("ALTER TABLE session_bindings ADD COLUMN session_id TEXT;");
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE session_bindings ADD COLUMN session_file TEXT;");
+    } catch {}
+
     // Prepare statements
     this.getStmt = this.db.prepare<RawSqliteRow, [string]>(
-      "SELECT thread_id, cwd, initial_model, created_at, updated_at, metadata FROM session_bindings WHERE thread_id = ?;"
+      "SELECT thread_id, cwd, initial_model, session_id, session_file, created_at, updated_at, metadata FROM session_bindings WHERE thread_id = ?;"
     );
 
     this.setStmt = this.db.prepare<
       void,
-      [string, string, string | null, number, number, string | null]
+      [string, string, string | null, string | null, string | null, number, number, string | null]
     >(`
-      INSERT INTO session_bindings (thread_id, cwd, initial_model, created_at, updated_at, metadata)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO session_bindings (thread_id, cwd, initial_model, session_id, session_file, created_at, updated_at, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(thread_id) DO UPDATE SET
         cwd = excluded.cwd,
         initial_model = excluded.initial_model,
+        session_id = COALESCE(excluded.session_id, session_bindings.session_id),
+        session_file = COALESCE(excluded.session_file, session_bindings.session_file),
         updated_at = excluded.updated_at,
         metadata = excluded.metadata;
     `);
@@ -95,7 +109,7 @@ export class SqliteSessionStore implements SessionStore {
     );
 
     this.listStmt = this.db.prepare<RawSqliteRow, []>(
-      "SELECT thread_id, cwd, initial_model, created_at, updated_at, metadata FROM session_bindings ORDER BY created_at ASC;"
+      "SELECT thread_id, cwd, initial_model, session_id, session_file, created_at, updated_at, metadata FROM session_bindings ORDER BY created_at ASC;"
     );
 
     this.clearStmt = this.db.prepare<void, []>(
@@ -129,6 +143,8 @@ export class SqliteSessionStore implements SessionStore {
       binding.threadId,
       binding.cwd,
       binding.initialModel ?? null,
+      binding.sessionId ?? null,
+      binding.sessionFile ?? null,
       createdAt,
       updatedAt,
       metadataStr
@@ -182,6 +198,8 @@ export class SqliteSessionStore implements SessionStore {
       threadId: row.thread_id,
       cwd: row.cwd,
       initialModel: row.initial_model ?? undefined,
+      sessionId: row.session_id ?? undefined,
+      sessionFile: row.session_file ?? undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       ...(metadata ? { metadata } : {}),
