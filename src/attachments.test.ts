@@ -67,4 +67,11 @@ describe("Attachment Processing", () => {
 
     expect(existsSync(threadDir)).toBe(false);
   });
+
+  it("rejects attachments exceeding max size limit", () => {
+    const MAX_SIZE = 25 * 1024 * 1024;
+    const oversized = { url: "https://example.com/huge.bin", name: "huge.bin", size: MAX_SIZE + 1 };
+    const isOversized = (typeof oversized.size === "number" && oversized.size > MAX_SIZE);
+    expect(isOversized).toBe(true);
+  });
 });

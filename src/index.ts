@@ -41,10 +41,25 @@ const allowedUserIds = new Set(
 );
 
 function isUserAllowed(userId: string): boolean {
-  if (allowedUserIds.size === 0) return true;
+  if (allowedUserIds.size === 0) return false;
   return allowedUserIds.has(userId);
 }
 
+function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
+  const normalizedRoot = resolve(rootDir);
+  const normalizedTarget = resolve(targetPath);
+  const rel = relative(normalizedRoot, normalizedTarget);
+  return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function getSanitizedChildEnv(): Record<string, string | undefined> {
+  const env = { ...process.env };
+  delete env.DISCORD_TOKEN;
+  delete env.DISCORD_CLIENT_ID;
+  delete env.ALLOWED_USERS;
+  delete env.WHITELISTED_USERS;
+  return env;
+}
 type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 interface SessionContext {
@@ -117,9 +132,10 @@ async function getGitBranch(cwd: string): Promise<string | null> {
  */
 async function getAdvisorConfig(cwd?: string): Promise<{ enabled: boolean; model: string | null }> {
   try {
+    const env = getSanitizedChildEnv();
     const [enabledProc, rolesProc] = [
-      spawn(["omp", "config", "get", "advisor.enabled"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
-      spawn(["omp", "config", "get", "modelRoles"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
+      spawn(["omp", "config", "get", "advisor.enabled"], cwd ? { cwd, env, stderr: "ignore" } : { env, stderr: "ignore" }),
+      spawn(["omp", "config", "get", "modelRoles"], cwd ? { cwd, env, stderr: "ignore" } : { env, stderr: "ignore" }),
     ];
 
     const [enabledOut, rolesOut] = await Promise.all([
@@ -146,6 +162,7 @@ async function getAdvisorConfig(cwd?: string): Promise<{ enabled: boolean; model
 async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models: OmpModelMeta[] }> {
   console.log("Discovering native OMP commands & models...");
   const proc = spawn(["omp", "--mode", "rpc"], {
+    env: getSanitizedChildEnv(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -156,7 +173,6 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
 
   let fetchedCommands: OmpCommandMeta[] = [];
   let fetchedModels: OmpModelMeta[] = [];
-
   const donePromise = new Promise<void>((resolve) => {
     let gotCommands = false;
     let gotModels = false;
@@ -367,6 +383,7 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
 
   const proc = spawn(args, {
     cwd,
+    env: getSanitizedChildEnv(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "inherit",
@@ -917,6 +934,9 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
       searchDir = dirname(targetPath);
       filePrefix = basename(targetPath).toLowerCase();
     }
+    if (!isInsideWorkspace(searchDir, rootDir)) {
+      return suggestions.slice(0, 25);
+    }
 
     if (existsSync(searchDir) && statSync(searchDir).isDirectory()) {
       if (searchDir === targetPath && existsSync(targetPath)) {
@@ -1050,6 +1070,15 @@ client.on("interactionCreate", async (interaction) => {
       ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
       : rawCwd;
     const cwd = resolve(rootDir, expandedRawCwd);
+    const normalizedRoot = resolve(rootDir);
+
+    if (!isInsideWorkspace(cwd, normalizedRoot)) {
+      await interaction.reply({
+        content: `⛔ Access denied: Directory must be inside the workspace root (\`${normalizedRoot}\`).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
     if (!existsSync(cwd)) {
       await interaction.reply({
@@ -1065,11 +1094,29 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferReply();
 
     try {
-      const thread = await textChannel.threads.create({
-        name: threadName,
-        autoArchiveDuration: 1440,
-      });
+      const createPrivateThreads = process.env.CREATE_PRIVATE_THREADS !== "false";
+      let thread: ThreadChannel;
 
+      if (createPrivateThreads && textChannel.type === ChannelType.GuildText) {
+        try {
+          thread = await textChannel.threads.create({
+            name: threadName,
+            type: ChannelType.PrivateThread,
+            autoArchiveDuration: 1440,
+          });
+        } catch (privErr) {
+          console.warn("Could not create private thread (missing permission?), falling back to public thread:", privErr);
+          thread = await textChannel.threads.create({
+            name: threadName,
+            autoArchiveDuration: 1440,
+          });
+        }
+      } else {
+        thread = await textChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 1440,
+        });
+      }
       const session = createOmpSession(thread, cwd, inputModel || undefined);
       sessions.set(thread.id, session);
 
@@ -1252,6 +1299,9 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
+const ATTACHMENT_FETCH_TIMEOUT_MS = 15000; // 15 seconds
+
 // Attachment Helpers
 interface ImagePayload {
   type: "image";
@@ -1260,15 +1310,28 @@ interface ImagePayload {
 }
 
 async function processImageAttachment(
-  att: { url: string; contentType?: string | null; name?: string | null },
+  att: { url: string; contentType?: string | null; name?: string | null; size?: number },
 ): Promise<ImagePayload | null> {
+  if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
+    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    return null;
+  }
   try {
-    const res = await fetch(att.url);
+    const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       console.error(`Failed to download image attachment ${att.name || "unnamed"} (status ${res.status})`);
       return null;
     }
+    const contentLength = Number(res.headers.get("content-length"));
+    if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      return null;
+    }
     const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      return null;
+    }
     const base64 = Buffer.from(arrayBuf).toString("base64");
     let mimeType = att.contentType || "";
     if (!mimeType || !mimeType.startsWith("image/")) {
@@ -1306,15 +1369,28 @@ function getAttachmentDir(session: SessionContext, messageId: string): string {
 async function saveNonImageAttachment(
   session: SessionContext,
   messageId: string,
-  att: { url: string; name?: string | null },
+  att: { url: string; name?: string | null; size?: number },
 ): Promise<string | null> {
+  if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
+    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    return null;
+  }
   try {
-    const res = await fetch(att.url);
+    const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       console.error(`Failed to download attachment ${att.name || "unnamed"} (status ${res.status})`);
       return null;
     }
+    const contentLength = Number(res.headers.get("content-length"));
+    if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      return null;
+    }
     const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      return null;
+    }
     const dir = getAttachmentDir(session, messageId);
     const rawName = att.name || "attachment";
     const sanitized = basename(rawName).replace(/[^a-zA-Z0-9._-]/g, "_") || "attachment";
@@ -1419,9 +1495,9 @@ client.on(Events.ThreadDelete, (thread) => {
 client.on(Events.ClientReady, () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
   if (allowedUserIds.size > 0) {
-    console.log(`🔒 User whitelist active: ${allowedUserIds.size} allowed user(s).`);
+    console.log(`🔒 User allowlist active: ${allowedUserIds.size} allowed user(s).`);
   } else {
-    console.log("🔓 User whitelist inactive: all users permitted.");
+    console.warn("⚠️ WARNING: No ALLOWED_USERS configured! All user interactions are blocked (fail-closed). Add Discord user IDs to ALLOWED_USERS in .env.");
   }
 });
 

@@ -8,12 +8,15 @@ services:
     image: omp-discord-bot:latest
     container_name: omp-discord-bot
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
       - ALLOWED_USERS=${ALLOWED_USERS:-}
+      - CREATE_PRIVATE_THREADS=${CREATE_PRIVATE_THREADS:-true}
       - WORKSPACE_ROOT=/workspace
       # LLM Provider & Gateway URLs / Keys
       - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
