@@ -24,8 +24,22 @@ import { SessionManager, type SessionContext, type OmpProcess } from "./session-
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
+import {
+  commitWorkspaceChanges,
+  createGitWorktree,
+  formatDiffForDiscord,
+  inspectGitDiff,
+  isDownloadableWorkspaceFile,
+  isInsideWorkspace,
+  listWorkspaceFiles,
+  MAX_WORKSPACE_DOWNLOAD_BYTES,
+  removeGitWorktree,
+  resolveWorkspaceFile,
+  type WorktreeInfo,
+} from "./workspace";
+
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -46,12 +60,6 @@ function isUserAllowed(userId: string): boolean {
   return allowedUserIds.has(userId);
 }
 
-function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
-  const normalizedRoot = resolve(rootDir);
-  const normalizedTarget = resolve(targetPath);
-  const rel = relative(normalizedRoot, normalizedTarget);
-  return !rel.startsWith("..") && !isAbsolute(rel);
-}
 
 function getSanitizedChildEnv(): Record<string, string | undefined> {
   const env = { ...process.env };
@@ -235,11 +243,39 @@ function buildSlashCommands() {
           .setDescription("Initial model to use for the session")
           .setAutocomplete(true)
           .setRequired(false),
+      )
+      .addBooleanOption((opt) =>
+        opt
+          .setName("worktree")
+          .setDescription("Create an isolated Git worktree for this session")
+          .setRequired(false),
       ),
 
     new SlashCommandBuilder()
       .setName("omp-terminate-all")
       .setDescription("Terminate all active OMP sessions and delete their Discord threads"),
+
+    new SlashCommandBuilder()
+      .setName("diff")
+      .setDescription("Inspect Git changes in this session workspace")
+      .addBooleanOption((opt) =>
+        opt.setName("staged").setDescription("Show staged changes instead of unstaged changes").setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt.setName("path").setDescription("Limit the diff to a workspace path").setAutocomplete(true).setRequired(false),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("download")
+      .setDescription("Download a file from this session workspace")
+      .addStringOption((opt) =>
+        opt.setName("path").setDescription("Workspace-relative file path").setAutocomplete(true).setRequired(true),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("commit")
+      .setDescription("Commit staged or tracked workspace changes")
+      .addStringOption((opt) => opt.setName("message").setDescription("Commit message").setRequired(true)),
 
     // 2. Skill runner with rich autocomplete
     new SlashCommandBuilder()
@@ -358,7 +394,12 @@ const client = new Client({
 });
 
 // Spawn OMP RPC instance for a thread
-function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: string): SessionContext {
+function createOmpSession(
+  thread: ThreadChannel,
+  cwd: string,
+  initialModel?: string,
+  metadata?: Record<string, unknown>,
+): SessionContext {
   let resolveInitialState: ((state: Record<string, unknown>) => void) | undefined;
   const initialStatePromise = new Promise<Record<string, unknown>>((resolve) => {
     resolveInitialState = resolve;
@@ -378,10 +419,27 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     stderr: "inherit",
   });
 
+  const metadataWorktree = metadata?.worktree;
+  const worktree =
+    metadataWorktree && typeof metadataWorktree === "object"
+      ? (() => {
+          const candidate = metadataWorktree as Record<string, unknown>;
+          if (
+            typeof candidate.path === "string" &&
+            typeof candidate.branch === "string" &&
+            typeof candidate.repoRoot === "string" &&
+            typeof candidate.gitDir === "string"
+          ) {
+            return candidate as unknown as WorktreeInfo;
+          }
+          return undefined;
+        })()
+      : undefined;
   const session: SessionContext = {
     process: proc,
     threadId: thread.id,
     cwd,
+    ...(worktree ? { worktree } : {}),
     currentStreamBuffer: "",
     lastEditTimestamp: 0,
     initialStatePromise,
@@ -412,34 +470,11 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
       session.editTimer = undefined;
     }
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
-    void sessionManager.remove(thread.id);
+    void sessionManager.terminate(session, undefined, false);
   });
   return session;
 }
 
-function cleanThreadAttachments(session: SessionContext): void {
-  try {
-    const primaryThreadDir = join(session.cwd, ".discord-attachments", session.threadId);
-    if (existsSync(primaryThreadDir)) {
-      rmSync(primaryThreadDir, { recursive: true, force: true });
-    }
-    const primaryBaseDir = join(session.cwd, ".discord-attachments");
-    if (existsSync(primaryBaseDir) && readdirSync(primaryBaseDir).length === 0) {
-      rmSync(primaryBaseDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean primary attachment directory for thread ${session.threadId}:`, err);
-  }
-
-  try {
-    const fallbackThreadDir = join(tmpdir(), "omp-discord-attachments", session.threadId);
-    if (existsSync(fallbackThreadDir)) {
-      rmSync(fallbackThreadDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean fallback attachment directory for thread ${session.threadId}:`, err);
-  }
-}
 
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
   await sessionManager.terminate(session, client, deleteThread);
@@ -1004,7 +1039,24 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
     }
   }
 
-  // Skill autocomplete
+  if ((interaction.commandName === "download" || interaction.commandName === "diff") && focused.name === "path") {
+    const session = sessionManager.get(interaction.channelId);
+    if (!session) {
+      await interaction.respond([]);
+      return;
+    }
+    const query = String(focused.value);
+    const suggestions = listWorkspaceFiles(session.cwd, query)
+      .filter((file) => interaction.commandName === "diff" || isDownloadableWorkspaceFile(file))
+      .slice(0, 25)
+      .map((file) => ({
+        name: `${file.relativePath} (${file.size} bytes)`.slice(0, 100),
+        value: file.relativePath.slice(0, 100),
+      }));
+    await interaction.respond(suggestions);
+    return;
+  }
+
   if (interaction.commandName === "skill" && focused.name === "name") {
     const query = focused.value.toLowerCase();
     const filtered = OMX_SKILLS
@@ -1079,6 +1131,7 @@ client.on("interactionCreate", async (interaction) => {
     const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
     const inputDir = interaction.options.getString("directory");
     const inputModel = interaction.options.getString("model");
+    const useWorktree = interaction.options.getBoolean("worktree") ?? false;
     const rawCwd = inputDir || rootDir;
     const expandedRawCwd = rawCwd.startsWith("~")
       ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
@@ -1107,6 +1160,7 @@ client.on("interactionCreate", async (interaction) => {
 
     await interaction.deferReply();
 
+    let createdWorktree: WorktreeInfo | undefined;
     try {
       const createPrivateThreads = process.env.CREATE_PRIVATE_THREADS !== "false";
       let thread: ThreadChannel;
@@ -1131,19 +1185,34 @@ client.on("interactionCreate", async (interaction) => {
           autoArchiveDuration: 1440,
         });
       }
-      const session = createOmpSession(thread, cwd, inputModel || undefined);
+      let sessionCwd = cwd;
+      if (useWorktree) {
+        const worktreeResult = await createGitWorktree(cwd, thread.id);
+        if (!worktreeResult.ok || !worktreeResult.worktree) {
+          throw new Error(worktreeResult.error || "Unable to create an isolated Git worktree.");
+        }
+        createdWorktree = worktreeResult.worktree;
+        sessionCwd = createdWorktree.path;
+      }
+      const session = createOmpSession(
+        thread,
+        sessionCwd,
+        inputModel || undefined,
+        createdWorktree ? { worktree: createdWorktree } : undefined,
+      );
       await sessionManager.register(session, {
         initialModel: inputModel || undefined,
         metadata: {
           guildId: thread.guildId,
           parentChannelId: thread.parentId,
           createdById: interaction.user.id,
+          ...(createdWorktree ? { worktree: createdWorktree } : {}),
         },
       });
       const [state, advisorConfig, branch] = await Promise.all([
         session.initialStatePromise,
-        getAdvisorConfig(cwd),
-        getGitBranch(cwd),
+        getAdvisorConfig(sessionCwd),
+        getGitBranch(sessionCwd),
       ]);
 
       const modelData = (state?.model as { id?: string; name?: string; provider?: string } | undefined) || {};
@@ -1170,19 +1239,21 @@ client.on("interactionCreate", async (interaction) => {
           { name: "🤖 Active Model", value: `\`${modelDisplay}\``, inline: true },
           { name: "🛡️ Advisor", value: advisorText, inline: true },
           { name: "🌿 Git Branch", value: branchText, inline: true },
-          { name: "📁 Working Directory", value: `\`${cwd}\``, inline: false },
-          { name: "🧠 Thinking Level", value: `\`${thinkingLevel}\``, inline: true },
+          { name: "📁 Working Directory", value: `\`${sessionCwd}\``, inline: false },
           { name: "⚡ Fast Mode", value: fastMode ? "⚡ Active" : "Off", inline: true },
         )
         .setTimestamp();
 
       await interaction.editReply(
-        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\`\n🤖 Model: \`${modelDisplay}\``,
+        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${sessionCwd}\`${createdWorktree ? `\n🌿 Isolated branch: \`${createdWorktree.branch}\`` : ""}\n🤖 Model: \`${modelDisplay}\``,
       );
       await thread.send({
         embeds: [sessionEmbed],
       });
     } catch (err) {
+      if (createdWorktree) {
+        await removeGitWorktree(createdWorktree);
+      }
       const errorMsg = err instanceof Error ? err.message : String(err);
       await interaction.editReply(`Failed to start session: ${errorMsg}`);
     }
@@ -1224,7 +1295,94 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  // /skill [name] [prompt]
+  // /diff [staged] [path]
+  if (interaction.commandName === "diff") {
+    const staged = interaction.options.getBoolean("staged") ?? false;
+    const pathFilter = interaction.options.getString("path") || undefined;
+    const result = await inspectGitDiff(session.cwd, { staged, path: pathFilter });
+    if (result.error) {
+      await interaction.reply(`❌ ${result.error}`);
+      return;
+    }
+    const scope = result.path ? ` for \`${result.path}\`` : "";
+    if (!result.hasChanges) {
+      await interaction.reply(`ℹ️ No ${staged ? "staged" : "unstaged"} changes${scope} found in this workspace.`);
+      return;
+    }
+    const summaryEmbed = new EmbedBuilder()
+      .setTitle(`${staged ? "Staged" : "Unstaged"} Git Changes`)
+      .setColor(0x2f80ed)
+      .addFields(
+        { name: "Summary", value: result.summary || "Changed files detected.", inline: false },
+        ...(result.stat.trim() ? [{ name: "Diff stat", value: `\`\`\`\n${result.stat.trim().slice(0, 900)}\n\`\`\``, inline: false }] : []),
+      )
+      .setTimestamp();
+    if (!result.hasDiff) {
+      await interaction.reply({
+        content: `ℹ️ Git reports changes${scope}, but there is no ${staged ? "staged" : "unstaged"} patch to display (for example, an untracked file).`,
+        embeds: [summaryEmbed],
+      });
+      return;
+    }
+    const formatted = formatDiffForDiscord(result.diff);
+    if (formatted.inline) {
+      await interaction.reply({ content: formatted.content, embeds: [summaryEmbed] });
+    } else {
+      await interaction.reply({
+        content: "📎 The diff is too large for a Discord message; the complete patch is attached.",
+        embeds: [summaryEmbed],
+        files: [{ attachment: formatted.attachment!, name: formatted.filename! }],
+      });
+    }
+    return;
+  }
+
+  // /download [path]
+  if (interaction.commandName === "download") {
+    const requestedPath = interaction.options.getString("path", true);
+    const result = resolveWorkspaceFile(session.cwd, requestedPath);
+    if (!result.ok || !result.file) {
+      await interaction.reply({ content: `❌ ${result.error || "Unable to resolve that file."}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!isDownloadableWorkspaceFile(result.file)) {
+      await interaction.reply({
+        content: `❌ That file is ${Math.ceil(result.file.size / (1024 * 1024))}MB, which exceeds Discord's 25MB attachment limit.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    try {
+      const contents = readFileSync(result.file.absolutePath);
+      if (contents.byteLength > MAX_WORKSPACE_DOWNLOAD_BYTES) {
+        await interaction.reply({ content: "❌ The file grew beyond Discord's 25MB attachment limit while it was being read.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.reply({
+        content: `📎 Downloading \`${result.file.relativePath}\` (${contents.byteLength} bytes).`,
+        files: [{ attachment: contents, name: basename(result.file.relativePath) }],
+      });
+    } catch {
+      await interaction.reply({ content: "❌ Unable to read that file from the session workspace.", flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  // /commit [message]
+  if (interaction.commandName === "commit") {
+    const message = interaction.options.getString("message", true);
+    await interaction.deferReply();
+    const result = await commitWorkspaceChanges(session.cwd, message);
+    if (result.error) {
+      await interaction.editReply(`❌ ${result.error}`);
+    } else if (!result.committed) {
+      await interaction.editReply("ℹ️ There are no staged or tracked changes to commit.");
+    } else {
+      await interaction.editReply(`✅ Committed workspace changes${result.hash ? ` as \`${result.hash}\`` : ""}.`);
+    }
+    return;
+  }
+
   if (interaction.commandName === "skill") {
     const skillName = interaction.options.getString("name", true);
     const prompt = interaction.options.getString("prompt", true);
