@@ -9,6 +9,14 @@ import { removeGitWorktree, type WorktreeInfo } from "./workspace";
 import type { ToolExecutionTrace } from "./observability";
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
+export interface UserPromptEntry {
+  discordMessageId: string;
+  text: string;
+  savedFilePaths?: string[];
+  imageCount: number;
+  timestamp: number;
+}
+
 export interface SessionContext {
   process: OmpProcess;
   threadId: string;
@@ -41,6 +49,10 @@ export interface SessionContext {
   toolTraceHistory?: ToolExecutionTrace[];
   /** Active tool traces keyed by the RPC execution/call id. */
   toolTraces?: Map<string, ToolExecutionTrace>;
+  pendingRpcRequests?: Map<string, (response: Record<string, unknown>) => void>;
+  userPrompts?: UserPromptEntry[];
+  isTurnInProgress?: boolean;
+  opQueue?: Promise<void>;
 }
 export interface SessionManagerOptions {
   store?: SessionStore;
@@ -128,6 +140,51 @@ export function cleanThreadAttachments(cwd: string, threadId: string): void {
   } catch (err) {
     console.error(`Failed to clean fallback attachment directory for thread ${threadId}:`, err);
   }
+}
+/**
+ * Send an RPC line to an OMP process.
+ */
+export function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
+  const line = JSON.stringify(command) + "\n";
+  session.process.stdin.write(line);
+  session.process.stdin.flush();
+}
+
+/**
+ * Send an RPC request and await its response matching id.
+ */
+export function sendRpcRequest(
+  session: SessionContext,
+  command: Record<string, unknown>,
+  timeoutMs = 10000,
+): Promise<Record<string, unknown>> {
+  const id =
+    (typeof command.id === "string" && command.id) ||
+    `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const fullCmd = { ...command, id };
+
+  if (!session.pendingRpcRequests) {
+    session.pendingRpcRequests = new Map();
+  }
+
+  const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+  const timer = setTimeout(() => {
+    session.pendingRpcRequests?.delete(id);
+    reject(
+      new Error(
+        `RPC request timeout for ${String(command.type || command.command || "unknown")}`,
+      ),
+    );
+  }, timeoutMs);
+
+  session.pendingRpcRequests.set(id, (res) => {
+    clearTimeout(timer);
+    session.pendingRpcRequests?.delete(id);
+    resolve(res);
+  });
+
+  sendRpc(session, fullCmd);
+  return promise;
 }
 /**
  * Stop typing indicator in Discord thread.

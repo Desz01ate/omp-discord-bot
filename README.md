@@ -7,6 +7,7 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 ## Features
 
 - **1:1 Thread $\leftrightarrow$ Session Mapping & Persistence**: Launching `/omp-new` creates a dedicated Discord thread with a generated `omp-session-*` name. The first prompt renames it to a status-prefixed topic (for example, `🟡 [ralph] Fix auth bug`) and later status transitions use `🟢` (idle), `🔴` (error), or `⏸️` (confirmation pending). Thread bindings survive bot restarts through a pluggable SQLite persistence layer (`SessionStore`).
+- **Message-Edit-as-a-Rewind**: Editing an earlier user message in a session thread automatically aborts any active turn, rewinds the session branch back to that message's checkpoint, and resubmits the edited prompt.
 - **Full Slash Command & Skill Bindings**:
   - `/skill <name> <prompt>` — Rich autocomplete for all OMX workflows (`$ralph`, `$plan`, `$deep-interview`, `$code-review`, `$tdd`, etc.).
   - `/cmd <command> [args]` — Rich autocomplete for all 102+ native OMP commands and subcommands (`/security`, `/advisor`, `/prewalk`, `/dump`, etc.).
@@ -162,8 +163,7 @@ journalctl --user -u omp-discord-bot.service -f
 Inside any thread created by `/omp-new`:
 - Plain text messages are dispatched directly to the agent as prompts.
 - Inline syntax like `$ralph Fix test regressions` or `/model claude-sonnet-4-5` works seamlessly.
-
----
+- **Message Edit Rewind**: If you edit an existing message in the thread (for instance fixing an incomplete prompt or revising instructions), the bot automatically aborts any in-flight agent turn, rewinds the conversation tree to that prompt checkpoint, and resubmits your edited prompt.
 
 ## Project Structure
 

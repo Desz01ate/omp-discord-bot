@@ -22,7 +22,14 @@ import {
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
-import { SessionManager, resolveOmpSessionPath, type SessionContext, type OmpProcess } from "./session-manager";
+import {
+  SessionManager,
+  resolveOmpSessionPath,
+  type SessionContext,
+  type OmpProcess,
+  sendRpc,
+  sendRpcRequest,
+} from "./session-manager";
 import {
   buildDynamicThreadName,
   buildQuickActionRow,
@@ -111,12 +118,6 @@ let cachedCommands: OmpCommandMeta[] = [];
 let cachedModels: OmpModelMeta[] = [];
 const sessionManager = new SessionManager();
 await sessionManager.init();
-// Helper: send RPC command
-function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
-  const line = JSON.stringify(command) + "\n";
-  session.process.stdin.write(line);
-  session.process.stdin.flush();
-}
 
 /**
  * Detect git branch or short commit hash for a directory if it is a git repo.
@@ -554,11 +555,9 @@ function createOmpSession(
   sessionId?: string,
   sessionFile?: string,
 ): SessionContext {
-  let resolveInitialState: ((state: Record<string, unknown>) => void) | undefined;
-  const initialStatePromise = new Promise<Record<string, unknown>>((resolve) => {
-    resolveInitialState = resolve;
-    setTimeout(() => resolve({}), 3000);
-  });
+  const { promise: initialStatePromise, resolve: resolveInitialState } =
+    Promise.withResolvers<Record<string, unknown>>();
+  setTimeout(() => resolveInitialState({}), 3000);
 
   const args = ["omp", "--mode", "rpc"];
   const resumeTarget = resolveOmpSessionPath(sessionFile, sessionId);
@@ -607,6 +606,9 @@ function createOmpSession(
     hudLastEditTimestamp: 0,
     toolTraces: new Map(),
     toolTraceHistory: [],
+    pendingRpcRequests: new Map(),
+    userPrompts: [],
+    isTurnInProgress: false,
   };
   void ensurePinnedHud(session, thread);
 
@@ -1000,6 +1002,15 @@ async function handleRpcEvent(
 ): Promise<void> {
   const type = typeof event.type === "string" ? event.type : "";
 
+  // Resolve pending RPC requests if matched
+  if (type === "response" && typeof event.id === "string" && session.pendingRpcRequests?.has(event.id)) {
+    const resolver = session.pendingRpcRequests.get(event.id);
+    session.pendingRpcRequests.delete(event.id);
+    if (resolver) {
+      resolver(event);
+    }
+  }
+
   // 1. Ready & Protocol Negotiation
   if (type === "ready") {
     sendRpc(session, {
@@ -1017,6 +1028,7 @@ async function handleRpcEvent(
   // 2. Fatal RPC errors
   if (type === "error" || type === "fatal_error") {
     session.isRunning = false;
+    session.isTurnInProgress = false;
     session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
@@ -1032,6 +1044,7 @@ async function handleRpcEvent(
   // 3. Turn Start
   if (type === "agent_start") {
     session.isRunning = true;
+    session.isTurnInProgress = true;
     session.completionBarAttached = false;
     session.confirmationPending = false;
     if (session.editTimer) {
@@ -1271,6 +1284,7 @@ async function handleRpcEvent(
   // 8. Turn Finish
   if (type === "agent_end") {
     session.isRunning = false;
+    session.isTurnInProgress = false;
     session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
@@ -1315,6 +1329,7 @@ async function handleRpcEvent(
   // 9. Prompt Result, including local command completion without agent_end.
   if (type === "prompt_result") {
     session.isRunning = false;
+    session.isTurnInProgress = false;
     session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
@@ -2089,23 +2104,18 @@ async function saveNonImageAttachment(
 }
 
 
-// Handle Chat Messages in Threads
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!isUserAllowed(message.author.id)) return;
-  const session = sessionManager.get(message.channelId);
-  if (!session) return;
-
-  if (message.channel.isThread()) {
-    startTyping(session, message.channel);
-  }
-
+async function prepareMessagePayload(
+  session: SessionContext,
+  message: Message,
+): Promise<{ text: string; images: ImagePayload[]; savedFilePaths: string[] }> {
   const images: ImagePayload[] = [];
   const savedFilePaths: string[] = [];
 
-  if (message.attachments.size > 0) {
+  if (message.attachments && message.attachments.size > 0) {
     for (const [, att] of message.attachments) {
-      const isImage = (att.contentType?.startsWith("image/") ?? false) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || "");
+      const isImage =
+        (att.contentType?.startsWith("image/") ?? false) ||
+        /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || "");
       if (isImage) {
         const img = await processImageAttachment(att);
         if (img) images.push(img);
@@ -2122,23 +2132,180 @@ client.on("messageCreate", async (message) => {
     text = text ? `${fileRefs} ${text}` : fileRefs;
   }
 
-  if (!text && images.length === 0) {
-    stopTyping(session);
-    return;
+  return { text, images, savedFilePaths };
+}
+
+// Handle Chat Messages in Threads
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (!isUserAllowed(message.author.id)) return;
+  const session = sessionManager.get(message.channelId);
+  if (!session) return;
+
+  session.opQueue = (session.opQueue || Promise.resolve())
+    .then(async () => {
+      if (message.channel.isThread()) {
+        startTyping(session, message.channel);
+      }
+
+      const { text, images, savedFilePaths } = await prepareMessagePayload(session, message);
+
+      if (!text && images.length === 0) {
+        stopTyping(session);
+        return;
+      }
+
+      if (!session.userPrompts) {
+        session.userPrompts = [];
+      }
+      session.userPrompts.push({
+        discordMessageId: message.id,
+        text,
+        savedFilePaths,
+        imageCount: images.length,
+        timestamp: Date.now(),
+      });
+      session.lastPrompt = message.content.trim() || "Attachment";
+      if (message.channel.isThread()) {
+        await updateThreadNameFromPrompt(message.channel, session.lastPrompt);
+      }
+
+      sendRpc(session, {
+        id: `prompt_${Date.now()}`,
+        type: "prompt",
+        message: text,
+        ...(images.length > 0 ? { images } : {}),
+      });
+    })
+    .catch((err) => {
+      console.error(`Error processing messageCreate for thread ${message.channelId}:`, err);
+      stopTyping(session);
+    });
+});
+
+// Handle Message Edits as Checkpoint Rewind in Threads
+client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
+  let newMessage: Message;
+  if (rawNewMessage.partial) {
+    try {
+      newMessage = await rawNewMessage.fetch();
+    } catch {
+      return;
+    }
+  } else {
+    newMessage = rawNewMessage as Message;
   }
 
-  session.lastPrompt = message.content.trim() || "Attachment";
-  if (message.channel.isThread()) {
-    await updateThreadNameFromPrompt(message.channel, session.lastPrompt);
-  }
+  if (newMessage.author?.bot) return;
+  if (newMessage.author && !isUserAllowed(newMessage.author.id)) return;
+  const session = sessionManager.get(newMessage.channelId);
+  if (!session) return;
 
+  session.opQueue = (session.opQueue || Promise.resolve())
+    .then(async () => {
+      if (!session.userPrompts || session.userPrompts.length === 0) return;
 
-  sendRpc(session, {
-    id: `prompt_${Date.now()}`,
-    type: "prompt",
-    message: text,
-    ...(images.length > 0 ? { images } : {}),
-  });
+      const promptIndex = session.userPrompts.findIndex(
+        (p) => p.discordMessageId === newMessage.id,
+      );
+      if (promptIndex === -1) return;
+
+      const previousPrompt = session.userPrompts[promptIndex];
+      const { text, images, savedFilePaths } = await prepareMessagePayload(session, newMessage);
+
+      // If text and images have not changed, skip (e.g. pin or embed update)
+      if (text === previousPrompt.text && images.length === previousPrompt.imageCount) {
+        return;
+      }
+
+      console.log(
+        `🔄 Message edit detected for thread ${session.threadId} (prompt index ${promptIndex}): "${previousPrompt.text}" -> "${text}". Rewinding to checkpoint...`,
+      );
+
+      if (newMessage.channel.isThread()) {
+        startTyping(session, newMessage.channel);
+      }
+
+      // 1. Abort active turn if in progress
+      if (session.isTurnInProgress) {
+        if (session.activePromptMsg) {
+          await session.activePromptMsg.delete().catch(() => {});
+          session.activePromptMsg = undefined;
+        }
+        session.currentStreamBuffer = "";
+        session.activeToolStatus = undefined;
+        if (session.editTimer) {
+          clearTimeout(session.editTimer);
+          session.editTimer = undefined;
+        }
+
+        try {
+          await sendRpcRequest(session, { type: "abort" }, 5000);
+        } catch (err) {
+          console.warn("Abort during rewind:", err);
+        }
+      }
+
+      // 2. Query branch messages to find target checkpoint entryId
+      try {
+        const branchRes = await sendRpcRequest(session, { type: "get_branch_messages" });
+        let branchMessages: Array<{ entryId: string; text: string }> = [];
+        if (
+          branchRes.data &&
+          typeof branchRes.data === "object" &&
+          "messages" in branchRes.data &&
+          Array.isArray(branchRes.data.messages)
+        ) {
+          branchMessages = branchRes.data.messages.filter(
+            (m): m is { entryId: string; text: string } =>
+              m && typeof m === "object" && typeof m.entryId === "string" && typeof m.text === "string",
+          );
+        }
+
+        let targetEntry: { entryId: string; text: string } | undefined = branchMessages[promptIndex];
+        if (!targetEntry) {
+          targetEntry = branchMessages.find((m) => m.text === previousPrompt.text);
+        }
+        if (targetEntry) {
+          console.log(`Rewinding OMP session to entryId: ${targetEntry.entryId} ("${targetEntry.text}")`);
+          await sendRpcRequest(session, { type: "branch", entryId: targetEntry.entryId });
+        } else {
+          console.warn(
+            `Branch entry for prompt at index ${promptIndex} not found in OMP branch messages (count: ${branchMessages.length}).`,
+          );
+        }
+      } catch (err) {
+        console.error("Failed to rewind OMP session branch:", err);
+      }
+
+      // 3. Truncate userPrompts history to remove rewound turns
+      session.userPrompts = session.userPrompts.slice(0, promptIndex);
+
+      // 4. If edited message has content, submit new prompt
+      if (!text && images.length === 0) {
+        stopTyping(session);
+        return;
+      }
+
+      session.userPrompts.push({
+        discordMessageId: newMessage.id,
+        text,
+        savedFilePaths,
+        imageCount: images.length,
+        timestamp: Date.now(),
+      });
+
+      sendRpc(session, {
+        id: `prompt_${Date.now()}`,
+        type: "prompt",
+        message: text,
+        ...(images.length > 0 ? { images } : {}),
+      });
+    })
+    .catch((err) => {
+      console.error(`Error processing messageUpdate for thread ${newMessage.channelId}:`, err);
+      stopTyping(session);
+    });
 });
 
 // Handle Message Reaction Shortcuts
