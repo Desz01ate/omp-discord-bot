@@ -92,14 +92,14 @@ function sendRpc(session: SessionContext, command: Record<string, unknown>): voi
  */
 async function getGitBranch(cwd: string): Promise<string | null> {
   try {
-    const branchProc = spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+    const branchProc = spawn(["git", "-c", "safe.directory=*", "rev-parse", "--abbrev-ref", "HEAD"], {
       cwd,
       stderr: "ignore",
     });
     const branch = (await new Response(branchProc.stdout).text()).trim();
     if (branch && branch !== "HEAD") return branch;
 
-    const commitProc = spawn(["git", "rev-parse", "--short", "HEAD"], {
+    const commitProc = spawn(["git", "-c", "safe.directory=*", "rev-parse", "--short", "HEAD"], {
       cwd,
       stderr: "ignore",
     });

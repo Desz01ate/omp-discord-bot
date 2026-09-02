@@ -15,9 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Link host user home to /root for hook path compatibility
 RUN mkdir -p /home && ln -sf /root /home/deszolate
 
+# Configure git safe directory for bind-mounted repositories
+RUN git config --global --add safe.directory '*'
+
 # Install Oh My Pi (omp) CLI globally
 RUN bun install -g @oh-my-pi/pi-coding-agent
-
 WORKDIR /app
 
 # Install project dependencies
