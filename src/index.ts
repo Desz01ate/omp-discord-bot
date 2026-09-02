@@ -55,6 +55,7 @@ interface SessionContext {
   lastEditTimestamp: number;
   activeToolStatus?: string;
   editTimer?: Timer;
+  typingTimer?: Timer;
   initialStatePromise?: Promise<Record<string, unknown>>;
   resolveInitialState?: (state: Record<string, unknown>) => void;
 }
@@ -399,6 +400,7 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
   });
 
   proc.exited.then((code) => {
+    stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
@@ -558,6 +560,30 @@ async function flushActivePromptMessage(session: SessionContext): Promise<void> 
 
   await session.activePromptMsg.edit(displayContent).catch(() => {});
 }
+/**
+ * Start or refresh typing indicator in Discord thread.
+ */
+function startTyping(session: SessionContext, thread: ThreadChannel): void {
+  if (session.typingTimer) {
+    clearInterval(session.typingTimer);
+    session.typingTimer = undefined;
+  }
+  void thread.sendTyping().catch(() => {});
+  session.typingTimer = setInterval(() => {
+    void thread.sendTyping().catch(() => {});
+  }, 8000);
+}
+
+/**
+ * Stop typing indicator in Discord thread.
+ */
+function stopTyping(session: SessionContext): void {
+  if (session.typingTimer) {
+    clearInterval(session.typingTimer);
+    session.typingTimer = undefined;
+  }
+}
+
 
 /**
  * Schedule throttled live update for Discord (~1 edit every 1.2s).
@@ -610,6 +636,7 @@ async function handleRpcEvent(
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
     session.lastEditTimestamp = Date.now();
+    startTyping(session, thread);
     return;
   }
 
@@ -794,6 +821,7 @@ async function handleRpcEvent(
 
   // 8. Turn Finish
   if (type === "agent_end") {
+    stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
@@ -820,6 +848,7 @@ async function handleRpcEvent(
 
   // 9. Prompt Result without agent turn (Local command completion)
   if (type === "prompt_result" && event.agentInvoked === false) {
+    stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
@@ -1108,6 +1137,9 @@ client.on("interactionCreate", async (interaction) => {
     const prompt = interaction.options.getString("prompt", true);
     const fullPrompt = `$${skillName} ${prompt}`;
 
+    if (interaction.channel?.isThread()) {
+      startTyping(session, interaction.channel);
+    }
     await interaction.reply(`🎯 Invoking skill \`$${skillName}\`...`);
     sendRpc(session, {
       id: `skill_${Date.now()}`,
@@ -1123,6 +1155,9 @@ client.on("interactionCreate", async (interaction) => {
     const args = interaction.options.getString("args") || "";
     const fullCommand = `/${cmdName} ${args}`.trim();
 
+    if (interaction.channel?.isThread()) {
+      startTyping(session, interaction.channel);
+    }
     await interaction.reply(`⚡ Running command \`${fullCommand}\`...`);
     sendRpc(session, {
       id: `cmd_${Date.now()}`,
@@ -1131,6 +1166,7 @@ client.on("interactionCreate", async (interaction) => {
     });
     return;
   }
+
 
   // /model [selection]
   if (interaction.commandName === "model") {
@@ -1222,6 +1258,10 @@ client.on("messageCreate", (message) => {
   const session = sessions.get(message.channelId);
   if (!session) return;
 
+  if (message.channel.isThread()) {
+    startTyping(session, message.channel);
+  }
+
   sendRpc(session, {
     id: `prompt_${Date.now()}`,
     type: "prompt",
@@ -1233,6 +1273,7 @@ client.on("messageCreate", (message) => {
 client.on(Events.ThreadDelete, (thread) => {
   const session = sessions.get(thread.id);
   if (session) {
+    stopTyping(session);
     console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
     try {
       session.process.kill();
