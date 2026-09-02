@@ -12,7 +12,7 @@
 - **Language**: TypeScript (ESNext target, module resolution bundler, strict mode)
 - **Frameworks & SDKs**: `discord.js` (v14.18+), `dotenv` (v16.4+)
 - **Integration Target**: Oh My Pi CLI (`omp`) running via standard I/O RPC protocol v2
-- **Daemonization**: Systemd user service (`scripts/init.sh`, `scripts/deinit.sh`, `scripts/run.sh`)
+- **Daemonization & Containerization**: Docker Compose (`docker-compose.yml`, `Dockerfile`) with host repository bind mount, and Systemd user service (`scripts/init.sh`, `scripts/deinit.sh`, `scripts/run.sh`)
 
 ---
 
@@ -20,9 +20,12 @@
 
 ```text
 omp-discord-bot/
-├── .env.example          # Template for DISCORD_TOKEN and DISCORD_CLIENT_ID
+├── .dockerignore         # Excluded paths for container builds
+├── .env.example          # Template for DISCORD_TOKEN, DISCORD_CLIENT_ID, and Docker mounts
 ├── .gitignore            # Git exclusions (node_modules, .env, tsconfig.tsbuildinfo, logs)
 ├── AGENTS.md             # Repository guidance and developer contract for AI agents
+├── docker-compose.yml    # Docker compose service with host directory bind mount
+├── Dockerfile            # Container definition with Bun, OMP CLI, and git tooling
 ├── package.json          # Project manifest, dependencies, and execution scripts
 ├── README.md             # User-facing documentation and feature reference
 ├── scripts/
@@ -32,7 +35,6 @@ omp-discord-bot/
 ├── src/
 │   └── index.ts          # Core gateway: Discord client, RPC subprocess manager, event loop
 └── tsconfig.json         # TypeScript compiler configuration (Bun types, noEmit)
-```
 
 ---
 
@@ -51,6 +53,18 @@ bun run start
 
 # Start bot in watch mode (auto-reload on source change)
 bun run dev
+```
+
+### Docker & Docker Compose
+```bash
+# Build and run in background with host workspace bind mount
+docker compose up -d --build
+
+# Follow container logs
+docker compose logs -f
+
+# Stop container
+docker compose down
 ```
 
 ### Service Management (Systemd User Daemon)

@@ -1,0 +1,37 @@
+services:
+  omp-discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: omp-discord-bot:latest
+    container_name: omp-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+      - ALLOWED_USERS=${ALLOWED_USERS:-}
+      - WORKSPACE_ROOT=/workspace
+      # LLM Provider & Gateway URLs / Keys
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      # Notification & Hook credentials
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_USER_ID=${TELEGRAM_USER_ID:-}
+    volumes:
+      # Host workspace: Bind mounts host repositories to /workspace inside container
+      - ${HOST_WORKSPACE_PATH:-./workspace}:/workspace
+      # OMP & Pi agent configurations (auth, models, history, roles)
+      - ${OMP_CONFIG_PATH:-~/.omp}:/root/.omp
+      - ${PI_CONFIG_PATH:-~/.pi}:/root/.pi
+      # OMX / Codex skills, prompts, and configurations
+      - ${CODEX_CONFIG_PATH:-~/.codex}:/root/.codex:ro
+      # (Optional) Git config for author identity in OMP commits
+      # - ${HOME}/.gitconfig:/root/.gitconfig:ro

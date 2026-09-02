@@ -14,7 +14,7 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
   - `/model [selection]` — Real-time model switcher with context window indicators.
   - `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
 - **Interactive UI Approvals**: Confirmation requests (`extension_ui_request`) render as Discord **Action Buttons** (`Approve` / `Deny`) with timeout handling.
-- **Systemd User Service**: One-command daemonization via `./scripts/init.sh` and `./scripts/deinit.sh`.
+- **Systemd User Service & Docker**: One-command daemonization via `./scripts/init.sh` or isolated containerized deployment with `docker compose`.
 
 ---
 
@@ -58,15 +58,43 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 
 ## Running the Bot
 
-### Option A: Foreground (Development / Testing)
+### Option A: Docker Compose (Recommended for Isolation & Portability)
+
+Docker runs the bot and OMP in an isolated container with your code repositories bind-mounted from the host into `/workspace`.
+
+1. In `.env`, specify the host repository directory to mount:
+   ```ini
+   HOST_WORKSPACE_PATH=/path/to/your/projects
+   OMP_CONFIG_PATH=~/.omp
+   ```
+
+2. Build and start with Docker Compose:
+   ```bash
+   # Build image and start in background
+   docker compose up -d --build
+
+   # View live logs
+   docker compose logs -f
+
+   # Stop the container
+   docker compose down
+   ```
+
+When using `/omp-new`, relative directory paths (e.g. `/omp-new directory: my-repo`) resolve directly to subdirectories within `/workspace/my-repo`.
+
+---
+
+### Option B: Foreground (Development / Testing)
 
 ```bash
 bun run start
 ```
 
-### Option B: Background Daemon (Systemd User Service)
+---
 
-Run without `sudo` under your user session:
+### Option C: Background Daemon (Systemd User Service)
+
+Run without `sudo` under your host user session:
 
 ```bash
 # Enable and start systemd user service
@@ -119,10 +147,14 @@ Inside any thread created by `/omp-new`:
 omp-discord-bot/
 ├── package.json          # Dependencies and scripts
 ├── tsconfig.json         # TypeScript compiler configuration
-├── .env.example          # Environment variable template
+├── Dockerfile            # Container image definition with Bun, OMP, and dev tools
+├── docker-compose.yml    # Compose specification with host directory bind mount
+├── .dockerignore         # Excluded files during Docker build
+├── .env.example          # Environment variable template (Discord, LLMs, Docker paths)
 ├── README.md             # Documentation
 ├── scripts/
 │   ├── init.sh           # Systemd user service installer and starter
+│   ├── run.sh            # Service launcher script
 │   └── deinit.sh         # Systemd user service stopper and remover
 └── src/
     └── index.ts          # Bot gateway, RPC manager, Discord event loop

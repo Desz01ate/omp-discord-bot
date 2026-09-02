@@ -1,0 +1,15 @@
+node_modules
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+logs
+.omx
+.codex
+.omp
+dist
+build
+.DS_Store
+tsconfig.tsbuildinfo

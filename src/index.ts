@@ -23,6 +23,7 @@ import { createInterface } from "readline";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, resolve } from "path";
+import { existsSync } from "fs";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -167,7 +168,7 @@ function buildSlashCommands() {
       .addStringOption((opt) =>
         opt
           .setName("directory")
-          .setDescription("Working directory path (default: current working directory)")
+          .setDescription("Working directory path (default: WORKSPACE_ROOT or current directory)")
           .setRequired(false),
       ),
 
@@ -815,10 +816,21 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const textChannel = channel as TextChannel;
-    const rawCwd = interaction.options.getString("directory") || process.cwd();
-    const cwd = resolve(
-      rawCwd.startsWith("~") ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "") : rawCwd,
-    );
+    const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
+    const inputDir = interaction.options.getString("directory");
+    const rawCwd = inputDir || rootDir;
+    const expandedRawCwd = rawCwd.startsWith("~")
+      ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
+      : rawCwd;
+    const cwd = resolve(rootDir, expandedRawCwd);
+
+    if (!existsSync(cwd)) {
+      await interaction.reply({
+        content: `❌ Directory \`${cwd}\` does not exist. Please specify a valid directory.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     const dirName = basename(cwd) || "workspace";
     const sessionId = Math.random().toString(36).slice(2, 8);
     const threadName = `${dirName} (${sessionId})`.slice(0, 100);
