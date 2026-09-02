@@ -88,7 +88,9 @@ const quickActionLastUsedAt = new Map<string, number>();
 const QUICK_ACTION_DEBOUNCE_MS = 750;
 
 function isUserAllowed(userId: string): boolean {
-  if (allowedUserIds.size === 0) { return false; }
+  if (allowedUserIds.size === 0) {
+    return false;
+  }
   return allowedUserIds.has(userId);
 }
 
@@ -139,7 +141,9 @@ async function getGitBranch(cwd: string): Promise<string | null> {
       stderr: "ignore",
     });
     const branch = (await new Response(branchProc.stdout).text()).trim();
-    if (branch && branch !== "HEAD") { return branch; }
+    if (branch && branch !== "HEAD") {
+      return branch;
+    }
 
     const commitProc = spawn(["git", "-c", "safe.directory=*", "rev-parse", "--short", "HEAD"], {
       cwd,
@@ -155,7 +159,9 @@ async function getGitBranch(cwd: string): Promise<string | null> {
 async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dirty: boolean | null }> {
   try {
     const branch = await getGitBranch(cwd);
-    if (!branch) {return { branch: null, dirty: null };}
+    if (!branch) {
+      return { branch: null, dirty: null };
+    }
     const statusProc = spawn(["git", "-c", "safe.directory=*", "status", "--porcelain"], {
       cwd,
       stderr: "ignore",
@@ -168,8 +174,12 @@ async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dir
 }
 
 function readNumericValue(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) { return value; }
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) { return Number(value); }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
   return undefined;
 }
 
@@ -185,22 +195,34 @@ function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
 }
 
 function readModelDisplay(data: Record<string, unknown>): string | undefined {
-  if (typeof data.model === "string") { return data.model; }
-  if (!data.model || typeof data.model !== "object") { return undefined; }
+  if (typeof data.model === "string") {
+    return data.model;
+  }
+  if (!data.model || typeof data.model !== "object") {
+    return undefined;
+  }
   const model = data.model as Record<string, unknown>;
   const id = typeof model.id === "string" ? model.id : undefined;
   const name = typeof model.name === "string" ? model.name : undefined;
   const provider = typeof model.provider === "string" ? model.provider : undefined;
-  if (!id && !name) { return undefined; }
+  if (!id && !name) {
+    return undefined;
+  }
   return `${provider ? `${ provider }/` : ""}${ id || name }${id && name ? ` (${ name })` : ""}`;
 }
 
 function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
   const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
-  if (typeof raw === "number") { return raw; }
-  if (!Array.isArray(raw)) { return undefined; }
+  if (typeof raw === "number") {
+    return raw;
+  }
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
   return raw.map((agent) => {
-    if (typeof agent === "string") { return agent; }
+    if (typeof agent === "string") {
+      return agent;
+    }
     if (agent && typeof agent === "object") {
       const item = agent as Record<string, unknown>;
       return String(item.name ?? item.id ?? item.role ?? "subagent");
@@ -231,7 +253,9 @@ function mergeHudState(session: SessionContext, data: Record<string, unknown>, a
 }
 
 async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
-  if (session.hudMessage) { return; }
+  if (session.hudMessage) {
+    return;
+  }
   if (session.hudInitPromise) {
     await session.hudInitPromise;
     return;
@@ -243,7 +267,9 @@ async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): 
       const pinned = await thread.messages.fetchPinned().catch(() => null);
       const existing = pinned?.find((message) => message.embeds.some((embed) => embed.title === "📡 OMP Live HUD"));
       session.hudMessage = existing || await thread.send({ embeds: [formatHudEmbed(initialState)] });
-      if (!existing) {await session.hudMessage.pin("OMP live observability HUD").catch(() => {});}
+      if (!existing) {
+        await session.hudMessage.pin("OMP live observability HUD").catch(() => {});
+      }
       session.hudLastEditTimestamp = Date.now();
       scheduleHudUpdate(session, thread);
     } catch (error) {
@@ -254,21 +280,27 @@ async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): 
   try {
     await initialization;
   } finally {
-    if (session.hudInitPromise === initialization) { session.hudInitPromise = undefined; }
+    if (session.hudInitPromise === initialization) {
+      session.hudInitPromise = undefined;
+    }
   }
 }
 
 async function flushHudUpdate(session: SessionContext): Promise<void> {
   clearTimeout(session.hudUpdateTimer);
   session.hudUpdateTimer = undefined;
-  if (!session.hudMessage) { return; }
+  if (!session.hudMessage) {
+    return;
+  }
   session.hudLastEditTimestamp = Date.now();
   await session.hudMessage.edit({ embeds: [formatHudEmbed((session.hudState || { cwd: session.cwd }) as HudState)] }).catch(() => {});
 }
 
 function scheduleHudUpdate(session: SessionContext, thread?: ThreadChannel): void {
   if (!session.hudMessage) {
-    if (thread) { void ensurePinnedHud(session, thread); }
+    if (thread) {
+      void ensurePinnedHud(session, thread);
+    }
     return;
   }
   const elapsed = Date.now() - (session.hudLastEditTimestamp || 0);
@@ -334,10 +366,14 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
     let gotModels = false;
 
     readline.on("line", (line: string) => {
-      if (!line.trim()) { return; }
+      if (!line.trim()) {
+        return;
+      }
       try {
         const frame: unknown = JSON.parse(line);
-        if (!frame || typeof frame !== "object") { return; }
+        if (!frame || typeof frame !== "object") {
+          return;
+        }
         const obj = frame as Record<string, unknown>;
 
         if (obj.type === "ready") {
@@ -633,7 +669,9 @@ function createOmpSession(
   });
 
   readline.on("line", (line: string) => {
-    if (!line.trim()) { return; }
+    if (!line.trim()) {
+      return;
+    }
     try {
       const event: unknown = JSON.parse(line);
       if (event && typeof event === "object") {
@@ -674,9 +712,13 @@ async function terminateSession(session: SessionContext, deleteThread = true): P
 }
 
 async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
-  if (!isDefaultThreadName(thread.name)) { return; }
+  if (!isDefaultThreadName(thread.name)) {
+    return;
+  }
   const nextName = buildDynamicThreadName(prompt, thread.name, "idle");
-  if (nextName === thread.name) { return; }
+  if (nextName === thread.name) {
+    return;
+  }
   await thread.setName(nextName).catch((err) => {
     console.warn(`Failed to derive a name for thread ${ thread.id }:`, err);
   });
@@ -807,7 +849,9 @@ async function flushActivePromptMessage(session: SessionContext): Promise<void> 
     clearTimeout(session.editTimer);
     session.editTimer = undefined;
   }
-  if (!session.activePromptMsg) { return; }
+  if (!session.activePromptMsg) {
+    return;
+  }
 
   session.lastEditTimestamp = Date.now();
 
@@ -868,7 +912,9 @@ function stopTyping(session: SessionContext): void {
  * Schedule throttled live update for Discord (~1 edit every 1.2s).
  */
 function scheduleActivePromptUpdate(session: SessionContext): void {
-  if (!session.activePromptMsg) { return; }
+  if (!session.activePromptMsg) {
+    return;
+  }
   const now = Date.now();
   const elapsed = now - session.lastEditTimestamp;
   const THROTTLE_MS = 1200;
@@ -899,7 +945,9 @@ function toolExitCodeFromEvent(event: Record<string, unknown>): number | null | 
   const raw = event.exitCode ?? event.exit_status ?? event.code ?? (event.result && typeof event.result === "object"
     ? (event.result as Record<string, unknown>).exitCode
     : undefined);
-  if (raw === null) { return null; }
+  if (raw === null) {
+    return null;
+  }
   return readNumericValue(raw);
 }
 
@@ -957,7 +1005,9 @@ async function handleToolExecutionUpdate(session: SessionContext, thread: Thread
   }
   trace.phase = "updated";
   const output = formatToolOutputPreview(toolOutputFromEvent(event));
-  if (output) { trace.outputPreview = output; }
+  if (output) {
+    trace.outputPreview = output;
+  }
   session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${ toolIcon(trace.toolName) } ${ trace.toolName }`, "running");
   scheduleActivePromptUpdate(session);
@@ -1233,7 +1283,9 @@ async function handleRpcEvent(
       const chunks = splitDiscordMessage(formatted, 1900);
       for (const chunk of chunks) {
         const sent = await thread.send(chunk).catch(() => null);
-        if (sent) { recordAssistantMessage(session, sent.id); }
+        if (sent) {
+          recordAssistantMessage(session, sent.id);
+        }
       }
     }
     return;
@@ -1353,14 +1405,20 @@ async function handleRpcEvent(
         .catch(() => {});
       for (let i = 1; i < chunks.length; i++) {
         const extraMsg = await thread.send(chunks[i]).catch(() => null);
-        if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
+        if (extraMsg) {
+          recordAssistantMessage(session, extraMsg.id);
+        }
       }
     } else {
       const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
-      if (firstMsg) { recordAssistantMessage(session, firstMsg.id); }
+      if (firstMsg) {
+        recordAssistantMessage(session, firstMsg.id);
+      }
       for (let i = 1; i < chunks.length; i++) {
         const extraMsg = await thread.send(chunks[i]).catch(() => null);
-        if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
+        if (extraMsg) {
+          recordAssistantMessage(session, extraMsg.id);
+        }
       }
     }
 
@@ -1427,15 +1485,21 @@ async function handleRpcEvent(
           .catch(() => {});
         for (let i = 1; i < chunks.length; i++) {
           const extraMsg = await thread.send(chunks[i]).catch(() => null);
-          if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
+          if (extraMsg) {
+            recordAssistantMessage(session, extraMsg.id);
+          }
         }
         session.activePromptMsg = undefined;
       } else {
         const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
-        if (firstMsg) { recordAssistantMessage(session, firstMsg.id); }
+        if (firstMsg) {
+          recordAssistantMessage(session, firstMsg.id);
+        }
         for (let i = 1; i < chunks.length; i++) {
           const extraMsg = await thread.send(chunks[i]).catch(() => null);
-          if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
+          if (extraMsg) {
+            recordAssistantMessage(session, extraMsg.id);
+          }
         }
       }
       session.completionBarAttached = true;
@@ -1518,9 +1582,15 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
 
       const entries = readdirSync(searchDir, { withFileTypes: true });
       for (const entry of entries) {
-        if (!entry.isDirectory()) { continue; }
-        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !filePrefix.startsWith(".") && filePrefix !== "node_modules") { continue; }
-        if (filePrefix && !entry.name.toLowerCase().startsWith(filePrefix)) { continue; }
+        if (!entry.isDirectory()) {
+          continue;
+        }
+        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !filePrefix.startsWith(".") && filePrefix !== "node_modules") {
+          continue;
+        }
+        if (filePrefix && !entry.name.toLowerCase().startsWith(filePrefix)) {
+          continue;
+        }
 
         let val: string;
         if (isAbs) {
@@ -1691,7 +1761,9 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  if (!interaction.isChatInputCommand()) { return; }
+  if (!interaction.isChatInputCommand()) {
+    return;
+  }
 
   // New Session
   if (interaction.commandName === "omp-new") {
@@ -2110,12 +2182,19 @@ async function processImageAttachment(
     let mimeType = att.contentType || "";
     if (!mimeType || !mimeType.startsWith("image/")) {
       const ext = (att.name || "").split(".").pop()?.toLowerCase();
-      if (ext === "png") { mimeType = "image/png"; }
-      else if (ext === "jpg" || ext === "jpeg") { mimeType = "image/jpeg"; }
-      else if (ext === "webp") { mimeType = "image/webp"; }
-      else if (ext === "gif") { mimeType = "image/gif"; }
-      else if (ext === "bmp") { mimeType = "image/bmp"; }
-      else { mimeType = "image/png"; }
+      if (ext === "png") {
+ mimeType = "image/png"; 
+} else if (ext === "jpg" || ext === "jpeg") {
+ mimeType = "image/jpeg"; 
+} else if (ext === "webp") {
+ mimeType = "image/webp"; 
+} else if (ext === "gif") {
+ mimeType = "image/gif"; 
+} else if (ext === "bmp") {
+ mimeType = "image/bmp"; 
+} else {
+  mimeType = "image/png";
+}
     }
     return {
       type: "image",
@@ -2190,10 +2269,14 @@ async function extractMessagePrompt(
       const isImage = (att.contentType?.startsWith("image/") ?? false) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || "");
       if (isImage) {
         const img = await processImageAttachment(att);
-        if (img) { images.push(img); }
+        if (img) {
+          images.push(img);
+        }
       } else {
         const filePath = await saveNonImageAttachment(session, message.id, att);
-        if (filePath) { savedFilePaths.push(filePath); }
+        if (filePath) {
+          savedFilePaths.push(filePath);
+        }
       }
     }
   }
@@ -2209,10 +2292,16 @@ async function extractMessagePrompt(
 
 // Handle Chat Messages in Threads
 client.on("messageCreate", async (message) => {
-  if (message.author.bot) { return; }
-  if (!isUserAllowed(message.author.id)) { return; }
+  if (message.author.bot) {
+    return;
+  }
+  if (!isUserAllowed(message.author.id)) {
+    return;
+  }
   const session = sessionManager.get(message.channelId);
-  if (!session) { return; }
+  if (!session) {
+    return;
+  }
   if (session.isRewinding) {
     await message.reply("⏳ *Session is currently rewinding. Please wait a moment before sending new messages.*").catch(() => {});
     return;
@@ -2258,17 +2347,27 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
 
 // Handle Message Reaction Shortcuts
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
-  if (user.bot || !isUserAllowed(user.id)) { return; }
+  if (user.bot || !isUserAllowed(user.id)) {
+    return;
+  }
 
   const resolvedReaction = reaction.partial ? await reaction.fetch().catch(() => null) : reaction;
-  if (!resolvedReaction) { return; }
+  if (!resolvedReaction) {
+    return;
+  }
   const shortcut = parseReactionShortcut(resolvedReaction.emoji.name);
-  if (!shortcut) { return; }
+  if (!shortcut) {
+    return;
+  }
 
   const channel = resolvedReaction.message.channel;
-  if (!channel.isThread()) { return; }
+  if (!channel.isThread()) {
+    return;
+  }
   const session = sessionManager.get(channel.id);
-  if (!session) { return; }
+  if (!session) {
+    return;
+  }
 
   if (shortcut === "abort") {
     if (session.isRunning === false) {

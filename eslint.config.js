@@ -1,3 +1,4 @@
+import stylistic from "@stylistic/eslint-plugin";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
@@ -6,11 +7,15 @@ export default tseslint.config(
   },
   {
     files: ["**/*.ts", "**/*.js"],
+    plugins: {
+      "@stylistic": stylistic,
+    },
     languageOptions: {
       parser: tseslint.parser,
     },
     rules: {
       curly: ["error", "all"],
+      "@stylistic/brace-style": ["error", "1tbs", { allowSingleLine: false }],
     },
   },
 );

@@ -160,7 +160,9 @@ export class SessionManager {
   }
 
   public async init(): Promise<void> {
-    if (this.isInitialized) { return; }
+    if (this.isInitialized) {
+      return;
+    }
     await this.store.init();
     this.isInitialized = true;
   }
@@ -219,8 +221,12 @@ export class SessionManager {
   ): Promise<void> {
     const session = this.activeSessions.get(threadId);
     if (session) {
-      if (updates.sessionId !== undefined) { session.sessionId = updates.sessionId; }
-      if (updates.sessionFile !== undefined) { session.sessionFile = updates.sessionFile; }
+      if (updates.sessionId !== undefined) {
+        session.sessionId = updates.sessionId;
+      }
+      if (updates.sessionFile !== undefined) {
+        session.sessionFile = updates.sessionFile;
+      }
     }
     const existing = await this.store.get(threadId);
     if (existing) {
@@ -323,7 +329,9 @@ export class SessionManager {
   public async terminateAll(client?: Client, deleteThreads = true): Promise<number> {
     const active = this.getActiveSessions();
     const count = active.length;
-    if (count === 0) { return 0; }
+    if (count === 0) {
+      return 0;
+    }
     await Promise.allSettled(active.map((s) => this.terminate(s, client, deleteThreads)));
     return count;
   }
@@ -402,8 +410,12 @@ export class SessionManager {
           binding.sessionId,
           binding.sessionFile,
         );
-        if (binding.sessionId && !session.sessionId) { session.sessionId = binding.sessionId; }
-        if (binding.sessionFile && !session.sessionFile) { session.sessionFile = binding.sessionFile; }
+        if (binding.sessionId && !session.sessionId) {
+          session.sessionId = binding.sessionId;
+        }
+        if (binding.sessionFile && !session.sessionFile) {
+          session.sessionFile = binding.sessionFile;
+        }
         this.activeSessions.set(channel.id, session);
         restoredCount++;
         console.log(`✅ Restored active OMP session for thread ${ channel.id } ("${ channel.name }") in ${ binding.cwd }`);

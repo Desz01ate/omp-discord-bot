@@ -63,7 +63,9 @@ export function formatTokenCount(value: number | undefined): string {
 }
 
 function formatContextPercent(value: number | undefined): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) { return "N/A"; }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "N/A";
+  }
   const percent = value <= 1 ? value * 100 : value;
   return `${ Math.round(percent) }%`;
 }
@@ -105,12 +107,16 @@ export function formatHudEmbed(state: HudState): EmbedBuilder {
     )
     .setFooter({ text: "Live session status • updates throttled to protect Discord rate limits" });
 
-  if (state.updatedAt) { embed.setTimestamp(state.updatedAt); }
+  if (state.updatedAt) {
+    embed.setTimestamp(state.updatedAt);
+  }
   return embed;
 }
 
 export function formatToolArguments(args: unknown): string {
-  if (args == null) { return ""; }
+  if (args == null) {
+    return "";
+  }
   let rendered: string;
   if (typeof args === "string") {
     rendered = args;
@@ -126,10 +132,14 @@ export function formatToolArguments(args: unknown): string {
 }
 
 export function formatToolOutputPreview(output: unknown): string {
-  if (output == null) { return ""; }
+  if (output == null) {
+    return "";
+  }
   const raw = typeof output === "string" ? output : formatToolArguments(output);
   const normalized = raw.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").trim();
-  if (!normalized) { return ""; }
+  if (!normalized) {
+    return "";
+  }
   const singleLine = normalized.length > MAX_TOOL_PREVIEW_LENGTH
     ? `${ normalized.slice(0, MAX_TOOL_PREVIEW_LENGTH - 3) }...`
     : normalized;
@@ -141,8 +151,12 @@ export function formatToolSummary(trace: ToolExecutionTrace): string {
     return trace.intent.trim();
   }
   const args = trace.args;
-  if (!args) { return ""; }
-  if (typeof args === "string") { return args.trim(); }
+  if (!args) {
+    return "";
+  }
+  if (typeof args === "string") {
+    return args.trim();
+  }
   if (typeof args === "object" && args !== null) {
     const record = args as Record<string, unknown>;
     for (const key of ["command", "path", "pattern", "query", "url", "file", "name", "title"]) {

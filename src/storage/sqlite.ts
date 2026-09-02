@@ -128,7 +128,9 @@ export class SqliteSessionStore implements SessionStore {
   public async get(threadId: string): Promise<SessionBinding | null> {
     this.ensureInitialized();
     const row = this.getStmt!.get(threadId);
-    if (!row) { return null; }
+    if (!row) {
+      return null;
+    }
     return this.mapRowToBinding(row);
   }
 
@@ -153,7 +155,9 @@ export class SqliteSessionStore implements SessionStore {
 
   public async delete(threadId: string): Promise<boolean> {
     this.ensureInitialized();
-    if (!this.db) { return false; }
+    if (!this.db) {
+      return false;
+    }
     const result = this.db.run("DELETE FROM session_bindings WHERE thread_id = ?;", [threadId]);
     return result.changes > 0;
   }

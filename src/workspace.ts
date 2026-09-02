@@ -45,7 +45,9 @@ function pathIsInside(targetPath: string, rootDir: string): boolean {
  * outside of it.
  */
 export function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
-  if (!pathIsInside(targetPath, rootDir)) { return false; }
+  if (!pathIsInside(targetPath, rootDir)) {
+    return false;
+  }
   try {
     const realRoot = realpathSync(rootDir);
     const realTarget = realpathSync(targetPath);
@@ -64,7 +66,9 @@ export interface GitRepositoryInfo {
 
 export async function getGitRepositoryInfo(cwd: string): Promise<GitRepositoryInfo | null> {
   const repoCheck = await runGitCommand(cwd, ["rev-parse", "--is-inside-work-tree"]);
-  if (repoCheck.code !== 0 || repoCheck.stdout.trim() !== "true") { return null; }
+  if (repoCheck.code !== 0 || repoCheck.stdout.trim() !== "true") {
+    return null;
+  }
 
   const [rootResult, gitDirResult] = await Promise.all([
     runGitCommand(cwd, ["rev-parse", "--show-toplevel"]),
@@ -72,7 +76,9 @@ export async function getGitRepositoryInfo(cwd: string): Promise<GitRepositoryIn
   ]);
   const root = rootResult.stdout.trim();
   const commonDir = gitDirResult.stdout.trim();
-  if (rootResult.code !== 0 || gitDirResult.code !== 0 || !root || !commonDir) { return null; }
+  if (rootResult.code !== 0 || gitDirResult.code !== 0 || !root || !commonDir) {
+    return null;
+  }
   return {
     root: resolve(root),
     gitDir: resolve(root, commonDir),
@@ -98,7 +104,9 @@ export interface GitDiffResult {
 }
 
 function normalizePathFilter(cwd: string, pathFilter?: string): { value?: string; error?: string } {
-  if (!pathFilter?.trim()) {return {};}
+  if (!pathFilter?.trim()) {
+    return {};
+  }
   const requested = pathFilter.trim();
   const absolute = isAbsolute(requested) ? resolve(requested) : resolve(cwd, requested);
   if (!isInsideWorkspace(absolute, cwd)) {
@@ -117,7 +125,9 @@ function summarizeStatus(status: string): string {
     .split("\n")
     .map((line) => line.trimEnd())
     .filter(Boolean);
-  if (lines.length === 0) { return "No changed files."; }
+  if (lines.length === 0) {
+    return "No changed files.";
+  }
   const counts = new Map<string, number>();
   for (const line of lines) {
     const code = line.slice(0, 2).trim() || "?";
@@ -250,7 +260,9 @@ export interface WorktreeResult {
 
 export async function createGitWorktree(cwd: string, threadId: string): Promise<WorktreeResult> {
   const repo = await getGitRepositoryInfo(cwd);
-  if (!repo) {return { ok: false, error: "This workspace is not a Git repository." };}
+  if (!repo) {
+    return { ok: false, error: "This workspace is not a Git repository." };
+  }
 
   const branch = `discord/${ threadId }`;
   const worktreePath = join(repo.root, ".omp-worktrees", threadId);
@@ -381,14 +393,18 @@ export interface WorkspaceFileResult {
 
 export function resolveWorkspaceFile(cwd: string, requestedPath: string): WorkspaceFileResult {
   const raw = requestedPath.trim();
-  if (!raw) {return { ok: false, error: "Please provide a file path." };}
+  if (!raw) {
+    return { ok: false, error: "Please provide a file path." };
+  }
   const absolutePath = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
   if (!isInsideWorkspace(absolutePath, cwd)) {
     return { ok: false, error: "That path is outside the session workspace." };
   }
   try {
     const fileStat = statSync(absolutePath);
-    if (!fileStat.isFile()) {return { ok: false, error: "The requested path is not a regular file." };}
+    if (!fileStat.isFile()) {
+      return { ok: false, error: "The requested path is not a regular file." };
+    }
     return {
       ok: true,
       file: {
@@ -403,7 +419,9 @@ export function resolveWorkspaceFile(cwd: string, requestedPath: string): Worksp
 }
 
 function collectWorkspaceFiles(rootDir: string, dir: string, output: WorkspaceFile[], limit: number): void {
-  if (output.length >= limit) { return; }
+  if (output.length >= limit) {
+    return;
+  }
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -411,15 +429,21 @@ function collectWorkspaceFiles(rootDir: string, dir: string, output: WorkspaceFi
     return;
   }
   for (const entry of entries) {
-    if (output.length >= limit) { return; }
-    if (entry.name === ".git" || entry.name === ".discord-attachments" || entry.name === ".omp-worktrees" || entry.name === "node_modules") { continue; }
+    if (output.length >= limit) {
+      return;
+    }
+    if (entry.name === ".git" || entry.name === ".discord-attachments" || entry.name === ".omp-worktrees" || entry.name === "node_modules") {
+      continue;
+    }
     const fullPath = join(dir, entry.name);
     try {
       if (entry.isDirectory()) {
         collectWorkspaceFiles(rootDir, fullPath, output, limit);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
         const resolved = resolveWorkspaceFile(rootDir, fullPath);
-        if (resolved.ok && resolved.file) { output.push(resolved.file); }
+        if (resolved.ok && resolved.file) {
+          output.push(resolved.file);
+        }
       }
     } catch {
       // A concurrently removed or unreadable entry is not an autocomplete result.

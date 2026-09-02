@@ -41,7 +41,9 @@ describe("workspace and Git integrations", () => {
   });
 
   afterEach(() => {
-    if (root && existsSync(root)) {rmSync(root, { recursive: true, force: true });}
+    if (root && existsSync(root)) {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("inspects unstaged and staged diffs with path filters", async () => {
