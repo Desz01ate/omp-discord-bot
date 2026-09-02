@@ -23,7 +23,8 @@ import { createInterface } from "readline";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
-import { existsSync, readdirSync, statSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -1251,8 +1252,107 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+// Attachment Helpers
+interface ImagePayload {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+async function processImageAttachment(
+  att: { url: string; contentType?: string | null; name?: string | null },
+): Promise<ImagePayload | null> {
+  try {
+    const res = await fetch(att.url);
+    if (!res.ok) {
+      console.error(`Failed to download image attachment ${att.name || "unnamed"} (status ${res.status})`);
+      return null;
+    }
+    const arrayBuf = await res.arrayBuffer();
+    const base64 = Buffer.from(arrayBuf).toString("base64");
+    let mimeType = att.contentType || "";
+    if (!mimeType || !mimeType.startsWith("image/")) {
+      const ext = (att.name || "").split(".").pop()?.toLowerCase();
+      if (ext === "png") mimeType = "image/png";
+      else if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
+      else if (ext === "webp") mimeType = "image/webp";
+      else if (ext === "gif") mimeType = "image/gif";
+      else if (ext === "bmp") mimeType = "image/bmp";
+      else mimeType = "image/png";
+    }
+    return {
+      type: "image",
+      data: base64,
+      mimeType,
+    };
+  } catch (err) {
+    console.error(`Error processing image attachment ${att.name || "unnamed"}:`, err);
+    return null;
+  }
+}
+
+function getAttachmentDir(session: SessionContext, messageId: string): string {
+  try {
+    const primaryDir = join(session.cwd, ".discord-attachments", session.threadId, messageId);
+    mkdirSync(primaryDir, { recursive: true });
+    return primaryDir;
+  } catch {
+    const fallbackDir = join(tmpdir(), "omp-discord-attachments", session.threadId, messageId);
+    mkdirSync(fallbackDir, { recursive: true });
+    return fallbackDir;
+  }
+}
+
+async function saveNonImageAttachment(
+  session: SessionContext,
+  messageId: string,
+  att: { url: string; name?: string | null },
+): Promise<string | null> {
+  try {
+    const res = await fetch(att.url);
+    if (!res.ok) {
+      console.error(`Failed to download attachment ${att.name || "unnamed"} (status ${res.status})`);
+      return null;
+    }
+    const arrayBuf = await res.arrayBuffer();
+    const dir = getAttachmentDir(session, messageId);
+    const rawName = att.name || "attachment";
+    const sanitized = basename(rawName).replace(/[^a-zA-Z0-9._-]/g, "_") || "attachment";
+    const targetPath = join(dir, sanitized);
+    writeFileSync(targetPath, Buffer.from(arrayBuf));
+    return targetPath;
+  } catch (err) {
+    console.error(`Error saving non-image attachment ${att.name || "unnamed"}:`, err);
+    return null;
+  }
+}
+
+function cleanThreadAttachments(session: SessionContext): void {
+  try {
+    const primaryThreadDir = join(session.cwd, ".discord-attachments", session.threadId);
+    if (existsSync(primaryThreadDir)) {
+      rmSync(primaryThreadDir, { recursive: true, force: true });
+    }
+    const primaryBaseDir = join(session.cwd, ".discord-attachments");
+    if (existsSync(primaryBaseDir) && readdirSync(primaryBaseDir).length === 0) {
+      rmSync(primaryBaseDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.error(`Failed to clean primary attachment directory for thread ${session.threadId}:`, err);
+  }
+
+  try {
+    const fallbackThreadDir = join(tmpdir(), "omp-discord-attachments", session.threadId);
+    if (existsSync(fallbackThreadDir)) {
+      rmSync(fallbackThreadDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.error(`Failed to clean fallback attachment directory for thread ${session.threadId}:`, err);
+  }
+}
+
 // Handle Chat Messages in Threads
-client.on("messageCreate", (message) => {
+client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!isUserAllowed(message.author.id)) return;
   const session = sessions.get(message.channelId);
@@ -1262,10 +1362,38 @@ client.on("messageCreate", (message) => {
     startTyping(session, message.channel);
   }
 
+  const images: ImagePayload[] = [];
+  const savedFilePaths: string[] = [];
+
+  if (message.attachments.size > 0) {
+    for (const [, att] of message.attachments) {
+      const isImage = (att.contentType?.startsWith("image/") ?? false) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || "");
+      if (isImage) {
+        const img = await processImageAttachment(att);
+        if (img) images.push(img);
+      } else {
+        const filePath = await saveNonImageAttachment(session, message.id, att);
+        if (filePath) savedFilePaths.push(filePath);
+      }
+    }
+  }
+
+  let text = message.content.trim();
+  if (savedFilePaths.length > 0) {
+    const fileRefs = savedFilePaths.map((p) => `@${p}`).join(" ");
+    text = text ? `${fileRefs} ${text}` : fileRefs;
+  }
+
+  if (!text && images.length === 0) {
+    stopTyping(session);
+    return;
+  }
+
   sendRpc(session, {
     id: `prompt_${Date.now()}`,
     type: "prompt",
-    message: message.content,
+    message: text,
+    ...(images.length > 0 ? { images } : {}),
   });
 });
 
@@ -1279,6 +1407,11 @@ client.on(Events.ThreadDelete, (thread) => {
       session.process.kill();
     } catch (err) {
       console.error(`Error terminating OMP process for deleted thread ${thread.id}:`, err);
+    }
+    try {
+      cleanThreadAttachments(session);
+    } catch (err) {
+      console.error(`Error cleaning attachments for thread ${thread.id}:`, err);
     }
   }
 });
