@@ -24,6 +24,17 @@ import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
 import { SessionManager, resolveOmpSessionPath, type SessionContext, type OmpProcess } from "./session-manager";
 import {
+  handleMessageEditAsRewind,
+  recordUserTurnCheckpoint,
+  recordAssistantMessage,
+  syncCheckpointsWithBranchMessages,
+  persistSessionCheckpoints,
+  resolvePendingRpcResponse,
+  rejectPendingRpcError,
+  type TurnCheckpoint,
+  type ImagePayload,
+} from "./rewind";
+import {
   buildDynamicThreadName,
   buildQuickActionRow,
   parseQuickActionId,
@@ -592,6 +603,9 @@ function createOmpSession(
           return undefined;
         })()
       : undefined;
+  const restoredCheckpoints = Array.isArray(metadata?.checkpoints)
+    ? (metadata.checkpoints as TurnCheckpoint[])
+    : [];
   const session: SessionContext = {
     process: proc,
     threadId: thread.id,
@@ -607,6 +621,8 @@ function createOmpSession(
     hudLastEditTimestamp: 0,
     toolTraces: new Map(),
     toolTraceHistory: [],
+    checkpoints: restoredCheckpoints,
+    pendingRpcRequests: new Map(),
   };
   void ensurePinnedHud(session, thread);
 
@@ -634,6 +650,13 @@ function createOmpSession(
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
+    }
+    if (session.pendingRpcRequests) {
+      for (const [, req] of session.pendingRpcRequests) {
+        clearTimeout(req.timer);
+        req.reject(new Error(`OMP process exited with code ${code}`));
+      }
+      session.pendingRpcRequests.clear();
     }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
@@ -999,6 +1022,18 @@ async function handleRpcEvent(
   event: Record<string, unknown>,
 ): Promise<void> {
   const type = typeof event.type === "string" ? event.type : "";
+  // Resolve pending RPC request promises
+  if (type === "response") {
+    resolvePendingRpcResponse(session, event);
+  } else if (type === "error" || type === "fatal_error") {
+    if (typeof event.id === "string") {
+      rejectPendingRpcError(
+        session,
+        event.id,
+        typeof event.message === "string" ? event.message : "RPC error",
+      );
+    }
+  }
 
   // 1. Ready & Protocol Negotiation
   if (type === "ready") {
@@ -1043,6 +1078,7 @@ async function handleRpcEvent(
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
+    recordAssistantMessage(session, session.activePromptMsg.id);
     session.lastEditTimestamp = Date.now();
     updateHudActivity(session, thread, undefined, "running");
     return;
@@ -1118,6 +1154,7 @@ async function handleRpcEvent(
         content: `⚠️ **Action Required**: ${messageText}`,
         components: [row],
       });
+      recordAssistantMessage(session, msg.id);
 
       const timeoutSeconds = typeof event.timeout === "number" ? event.timeout : 30;
       const confirmation = await msg
@@ -1195,7 +1232,8 @@ async function handleRpcEvent(
       const formatted = trimmed.startsWith("```") ? trimmed : `\`\`\`\n${trimmed}\n\`\`\``;
       const chunks = splitDiscordMessage(formatted, 1900);
       for (const chunk of chunks) {
-        await thread.send(chunk).catch(() => {});
+        const sent = await thread.send(chunk).catch(() => null);
+        if (sent) recordAssistantMessage(session, sent.id);
       }
     }
     return;
@@ -1268,8 +1306,34 @@ async function handleRpcEvent(
     return;
   }
 
+  if (type === "response" && event.command === "get_branch_messages" && event.data && typeof event.data === "object") {
+    const data = event.data as { messages?: Array<{ entryId: string; text: string }> };
+    if (Array.isArray(data.messages)) {
+      syncCheckpointsWithBranchMessages(session, data.messages);
+      void persistSessionCheckpoints(session, sessionManager);
+    }
+    return;
+  }
+
   // 8. Turn Finish
   if (type === "agent_end") {
+    if (session.isRewinding) {
+      session.isRunning = false;
+      session.confirmationPending = false;
+      stopTyping(session);
+      if (session.editTimer) {
+        clearTimeout(session.editTimer);
+        session.editTimer = undefined;
+      }
+      if (session.activePromptMsg) {
+        await session.activePromptMsg.delete().catch(() => {});
+        session.activePromptMsg = undefined;
+      }
+      session.currentStreamBuffer = "";
+      session.activeToolStatus = undefined;
+      return;
+    }
+
     session.isRunning = false;
     session.confirmationPending = false;
     stopTyping(session);
@@ -1283,16 +1347,20 @@ async function handleRpcEvent(
     const chunks = splitDiscordMessage(responseText, 1950);
 
     if (session.activePromptMsg) {
+      recordAssistantMessage(session, session.activePromptMsg.id);
       await session.activePromptMsg
         .edit({ content: chunks[0], embeds: [], components })
         .catch(() => {});
       for (let i = 1; i < chunks.length; i++) {
-        await thread.send(chunks[i]).catch(() => {});
+        const extraMsg = await thread.send(chunks[i]).catch(() => null);
+        if (extraMsg) recordAssistantMessage(session, extraMsg.id);
       }
     } else {
-      await thread.send({ content: chunks[0], components }).catch(() => {});
+      const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
+      if (firstMsg) recordAssistantMessage(session, firstMsg.id);
       for (let i = 1; i < chunks.length; i++) {
-        await thread.send(chunks[i]).catch(() => {});
+        const extraMsg = await thread.send(chunks[i]).catch(() => null);
+        if (extraMsg) recordAssistantMessage(session, extraMsg.id);
       }
     }
 
@@ -1309,11 +1377,31 @@ async function handleRpcEvent(
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     updateHudActivity(session, thread, undefined, "idle");
+
+    // Sync checkpoint entryIds with OMP transcript
+    sendRpc(session, { id: `sync_branch_${Date.now()}`, type: "get_branch_messages" });
     return;
   }
 
   // 9. Prompt Result, including local command completion without agent_end.
   if (type === "prompt_result") {
+    if (session.isRewinding) {
+      session.isRunning = false;
+      session.confirmationPending = false;
+      stopTyping(session);
+      if (session.editTimer) {
+        clearTimeout(session.editTimer);
+        session.editTimer = undefined;
+      }
+      if (session.activePromptMsg) {
+        await session.activePromptMsg.delete().catch(() => {});
+        session.activePromptMsg = undefined;
+      }
+      session.currentStreamBuffer = "";
+      session.activeToolStatus = undefined;
+      return;
+    }
+
     session.isRunning = false;
     session.confirmationPending = false;
     stopTyping(session);
@@ -1333,17 +1421,21 @@ async function handleRpcEvent(
       const components = [buildQuickActionRow(session.threadId)];
 
       if (session.activePromptMsg) {
+        recordAssistantMessage(session, session.activePromptMsg.id);
         await session.activePromptMsg
           .edit({ content: chunks[0], embeds: [], components })
           .catch(() => {});
         for (let i = 1; i < chunks.length; i++) {
-          await thread.send(chunks[i]).catch(() => {});
+          const extraMsg = await thread.send(chunks[i]).catch(() => null);
+          if (extraMsg) recordAssistantMessage(session, extraMsg.id);
         }
         session.activePromptMsg = undefined;
       } else {
-        await thread.send({ content: chunks[0], components }).catch(() => {});
+        const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
+        if (firstMsg) recordAssistantMessage(session, firstMsg.id);
         for (let i = 1; i < chunks.length; i++) {
-          await thread.send(chunks[i]).catch(() => {});
+          const extraMsg = await thread.send(chunks[i]).catch(() => null);
+          if (extraMsg) recordAssistantMessage(session, extraMsg.id);
         }
       }
       session.completionBarAttached = true;
@@ -1352,6 +1444,9 @@ async function handleRpcEvent(
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     updateHudActivity(session, thread, undefined, "idle");
+
+    // Sync checkpoint entryIds with OMP transcript
+    sendRpc(session, { id: `sync_branch_${Date.now()}`, type: "get_branch_messages" });
   }
 }
 
@@ -1987,12 +2082,6 @@ client.on("interactionCreate", async (interaction) => {
 const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
 const ATTACHMENT_FETCH_TIMEOUT_MS = 15000; // 15 seconds
 
-// Attachment Helpers
-interface ImagePayload {
-  type: "image";
-  data: string;
-  mimeType: string;
-}
 
 async function processImageAttachment(
   att: { url: string; contentType?: string | null; name?: string | null; size?: number },
@@ -2089,17 +2178,10 @@ async function saveNonImageAttachment(
 }
 
 
-// Handle Chat Messages in Threads
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!isUserAllowed(message.author.id)) return;
-  const session = sessionManager.get(message.channelId);
-  if (!session) return;
-
-  if (message.channel.isThread()) {
-    startTyping(session, message.channel);
-  }
-
+async function extractMessagePrompt(
+  session: SessionContext,
+  message: Message,
+): Promise<{ text: string; images: ImagePayload[] }> {
   const images: ImagePayload[] = [];
   const savedFilePaths: string[] = [];
 
@@ -2122,9 +2204,28 @@ client.on("messageCreate", async (message) => {
     text = text ? `${fileRefs} ${text}` : fileRefs;
   }
 
+  return { text, images };
+}
+
+// Handle Chat Messages in Threads
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (!isUserAllowed(message.author.id)) return;
+  const session = sessionManager.get(message.channelId);
+  if (!session) return;
+  if (session.isRewinding) {
+    await message.reply("⏳ *Session is currently rewinding. Please wait a moment before sending new messages.*").catch(() => {});
+    return;
+  }
+
+  const { text, images } = await extractMessagePrompt(session, message);
   if (!text && images.length === 0) {
     stopTyping(session);
     return;
+  }
+
+  if (message.channel.isThread()) {
+    startTyping(session, message.channel);
   }
 
   session.lastPrompt = message.content.trim() || "Attachment";
@@ -2132,12 +2233,26 @@ client.on("messageCreate", async (message) => {
     await updateThreadNameFromPrompt(message.channel, session.lastPrompt);
   }
 
+  recordUserTurnCheckpoint(session, message.id, message.content.trim());
+  void persistSessionCheckpoints(session, sessionManager);
 
   sendRpc(session, {
     id: `prompt_${Date.now()}`,
     type: "prompt",
     message: text,
     ...(images.length > 0 ? { images } : {}),
+  });
+});
+
+// Handle Message Edit as Rewind
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  await handleMessageEditAsRewind(oldMessage, newMessage, {
+    sessionManager,
+    isUserAllowed,
+    extractMessagePrompt,
+    startTyping,
+    updateThreadNameFromPrompt,
+    sendRpc,
   });
 });
 
