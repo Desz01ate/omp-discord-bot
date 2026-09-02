@@ -82,6 +82,29 @@ Docker runs the bot and OMP in an isolated container with your code repositories
 
 When using `/omp-new`, relative directory paths (e.g. `/omp-new directory: my-repo`) resolve directly to subdirectories within `/workspace/my-repo`.
 
+#### Adding Additional Runtimes (Go, Java, .NET, Rust, etc.)
+
+You do not need to fork or edit the `Dockerfile` to add compilers and SDKs:
+
+1. **Dynamic Per-Project Runtimes (`mise`)**:
+   The container includes [`mise`](https://mise.jdx.dev/). If your project in `/workspace/my-repo` contains a `.mise.toml`, `mise` will automatically provide the configured SDKs:
+   ```toml
+   [tools]
+   go = "1.23.0"
+   java = "openjdk-21"
+   dotnet = "8.0"
+   rust = "latest"
+   ```
+   Toolchain binaries are persistently cached on the host at `HOST_MISE_DATA_PATH` (defaults to `~/.cache/omp-discord-bot/mise`).
+
+2. **System Packages via `.env`**:
+   Specify extra Debian packages to bake in during `docker compose build`:
+   ```ini
+   EXTRA_APT_PACKAGES=golang-go default-jdk dotnet-sdk-8.0
+   ```
+   Then rebuild the container: `docker compose build`.
+
+
 ---
 
 ### Option B: Foreground (Development / Testing)
