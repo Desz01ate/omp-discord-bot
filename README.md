@@ -180,7 +180,8 @@ omp-discord-bot/
 │   ├── run.sh            # Service launcher script
 │   └── deinit.sh         # Systemd user service stopper and remover
 └── src/
-    ├── index.ts          # Bot gateway, RPC manager, Discord event loop
+    ├── index.ts          # Bot gateway, event loop, slash command registry
+    ├── session-manager.ts # Composite session manager unifying hot processes and cold persistence
     └── storage/          # Pluggable persistence layer (SessionStore, SQLite, InMemory)
         ├── index.ts      # Storage factory and exports
         ├── types.ts      # SessionStore and SessionBinding contracts

@@ -18,9 +18,9 @@ import {
   Events,
   type AutocompleteInteraction,
 } from "discord.js";
-import { createSessionStore, type SessionStore, type SessionBinding } from "./storage";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
+import { SessionManager, type SessionContext, type OmpProcess } from "./session-manager";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
@@ -61,21 +61,6 @@ function getSanitizedChildEnv(): Record<string, string | undefined> {
   delete env.WHITELISTED_USERS;
   return env;
 }
-type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
-
-interface SessionContext {
-  process: OmpProcess;
-  threadId: string;
-  cwd: string;
-  activePromptMsg?: Message;
-  currentStreamBuffer: string;
-  lastEditTimestamp: number;
-  activeToolStatus?: string;
-  editTimer?: Timer;
-  typingTimer?: Timer;
-  initialStatePromise?: Promise<Record<string, unknown>>;
-  resolveInitialState?: (state: Record<string, unknown>) => void;
-}
 
 interface OmpCommandMeta {
   name: string;
@@ -95,11 +80,8 @@ interface OmpModelMeta {
 // Global cached metadata from OMP
 let cachedCommands: OmpCommandMeta[] = [];
 let cachedModels: OmpModelMeta[] = [];
-
-const sessions = new Map<string, SessionContext>();
-const sessionStore: SessionStore = createSessionStore();
-await sessionStore.init();
-
+const sessionManager = new SessionManager();
+await sessionManager.init();
 // Helper: send RPC command
 function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
   const line = JSON.stringify(command) + "\n";
@@ -180,7 +162,7 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
     let gotCommands = false;
     let gotModels = false;
 
-    readline.on("line", (line) => {
+    readline.on("line", (line: string) => {
       if (!line.trim()) return;
       try {
         const frame: unknown = JSON.parse(line);
@@ -412,7 +394,7 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     terminal: false,
   });
 
-  readline.on("line", (line) => {
+  readline.on("line", (line: string) => {
     if (!line.trim()) return;
     try {
       const event: unknown = JSON.parse(line);
@@ -423,20 +405,15 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
       console.error("RPC parse error:", err);
     }
   });
-
-  proc.exited.then((code) => {
+  proc.exited.then((code: number | null) => {
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
-    sessions.delete(thread.id);
-    void sessionStore.delete(thread.id).catch((err) => {
-      console.error(`Failed to remove session binding for thread ${thread.id} from store:`, err);
-    });
+    void sessionManager.remove(thread.id);
   });
-
   return session;
 }
 
@@ -465,42 +442,8 @@ function cleanThreadAttachments(session: SessionContext): void {
 }
 
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
-  stopTyping(session);
-  if (session.editTimer) {
-    clearTimeout(session.editTimer);
-    session.editTimer = undefined;
-  }
-
-  try {
-    session.process.kill();
-  } catch (err) {
-    console.error(`Error terminating OMP process for thread ${session.threadId}:`, err);
-  }
-
-  try {
-    cleanThreadAttachments(session);
-  } catch (err) {
-    console.error(`Error cleaning attachments for thread ${session.threadId}:`, err);
-  }
-
-  if (deleteThread) {
-    try {
-      const channel =
-        client.channels.cache.get(session.threadId) ??
-        (await client.channels.fetch(session.threadId).catch(() => null));
-      if (channel && channel.isThread()) {
-        await channel.delete("Terminated via /omp-terminate-all");
-      }
-    } catch (err) {
-      console.error(`Error deleting thread ${session.threadId}:`, err);
-    }
-  }
-  sessions.delete(session.threadId);
-  await sessionStore.delete(session.threadId).catch((err) => {
-    console.error(`Failed to remove session binding for thread ${session.threadId} from store:`, err);
-  });
+  await sessionManager.terminate(session, client, deleteThread);
 }
-
 /**
  * Format tool execution details into a concise, user-friendly status line.
  */
@@ -1189,20 +1132,14 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
       const session = createOmpSession(thread, cwd, inputModel || undefined);
-      sessions.set(thread.id, session);
-      await sessionStore.set({
-        threadId: thread.id,
-        cwd,
+      await sessionManager.register(session, {
         initialModel: inputModel || undefined,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
         metadata: {
           guildId: thread.guildId,
           parentChannelId: thread.parentId,
           createdById: interaction.user.id,
         },
       });
-
       const [state, advisorConfig, branch] = await Promise.all([
         session.initialStatePromise,
         getAdvisorConfig(cwd),
@@ -1254,8 +1191,8 @@ client.on("interactionCreate", async (interaction) => {
 
   // Terminate All Sessions
   if (interaction.commandName === "omp-terminate-all") {
-    const activeSessions = Array.from(sessions.values());
-    if (activeSessions.length === 0) {
+    const count = sessionManager.count;
+    if (count === 0) {
       await interaction.reply({
         content: "ℹ️ No active OMP sessions found.",
         flags: MessageFlags.Ephemeral,
@@ -1264,11 +1201,9 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply();
-    const count = activeSessions.length;
     console.log(`🛑 /omp-terminate-all requested: Terminating ${count} active session(s)...`);
 
-    await Promise.allSettled(activeSessions.map((s) => terminateSession(s, true)));
-
+    await sessionManager.terminateAll(client, true);
     try {
       await interaction.editReply(
         `🛑 Successfully terminated ${count} active OMP session${count === 1 ? "" : "s"} and deleted associated Discord thread${count === 1 ? "" : "s"}.`,
@@ -1280,7 +1215,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // Session-bound Slash Commands
-  const session = sessions.get(interaction.channelId);
+  const session = sessionManager.get(interaction.channelId);
   if (!session) {
     await interaction.reply({
       content: "⚠️ This command must be executed inside an active OMP thread created by `/omp-new`.",
@@ -1518,7 +1453,7 @@ async function saveNonImageAttachment(
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!isUserAllowed(message.author.id)) return;
-  const session = sessions.get(message.channelId);
+  const session = sessionManager.get(message.channelId);
   if (!session) return;
 
   if (message.channel.isThread()) {
@@ -1562,69 +1497,9 @@ client.on("messageCreate", async (message) => {
 
 // Handle Thread Deletions to clean up OMP processes automatically
 client.on(Events.ThreadDelete, (thread) => {
-  const session = sessions.get(thread.id);
-  if (session) {
-    console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
-    void terminateSession(session, false);
-  } else {
-    void sessionStore.delete(thread.id).catch((err) => {
-      console.error(`Failed to delete session binding for deleted thread ${thread.id}:`, err);
-    });
-  }
+  console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
+  void sessionManager.terminate(thread.id, client, false);
 });
-
-async function restorePersistedSessions(): Promise<void> {
-  try {
-    const bindings = await sessionStore.list();
-    if (bindings.length === 0) {
-      console.log("📦 No persisted sessions found to restore.");
-      return;
-    }
-
-    console.log(`📦 Found ${bindings.length} persisted session(s). Restoring bindings...`);
-    let restoredCount = 0;
-
-    for (const binding of bindings) {
-      try {
-        if (!existsSync(binding.cwd)) {
-          console.warn(`⚠️ Working directory for thread ${binding.threadId} no longer exists (\`${binding.cwd}\`). Cleaning up binding.`);
-          await sessionStore.delete(binding.threadId);
-          continue;
-        }
-
-        const channel =
-          client.channels.cache.get(binding.threadId) ??
-          (await client.channels.fetch(binding.threadId).catch(() => null));
-
-        if (!channel || !channel.isThread()) {
-          console.warn(`⚠️ Discord thread ${binding.threadId} is no longer accessible. Cleaning up binding.`);
-          await sessionStore.delete(binding.threadId);
-          continue;
-        }
-
-        if (channel.archived || channel.locked) {
-          console.log(`ℹ️ Discord thread ${binding.threadId} is archived/locked. Skipping RPC spawn.`);
-          continue;
-        }
-
-        if (sessions.has(binding.threadId)) {
-          continue;
-        }
-
-        const session = createOmpSession(channel, binding.cwd, binding.initialModel);
-        sessions.set(channel.id, session);
-        restoredCount++;
-        console.log(`✅ Restored active OMP session for thread ${channel.id} ("${channel.name}") in ${binding.cwd}`);
-      } catch (err) {
-        console.error(`Failed to restore session for thread ${binding.threadId}:`, err);
-      }
-    }
-
-    console.log(`🚀 Session restoration complete: ${restoredCount}/${bindings.length} active session(s) bound.`);
-  } catch (err) {
-    console.error("Error during session restoration:", err);
-  }
-}
 
 client.on(Events.ClientReady, async () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
@@ -1633,7 +1508,7 @@ client.on(Events.ClientReady, async () => {
   } else {
     console.warn("⚠️ WARNING: No ALLOWED_USERS configured! All user interactions are blocked (fail-closed). Add Discord user IDs to ALLOWED_USERS in .env.");
   }
-  await restorePersistedSessions();
+  await sessionManager.restoreAll(client, createOmpSession);
 });
 
 client.login(DISCORD_TOKEN);
