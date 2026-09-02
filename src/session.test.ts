@@ -45,7 +45,7 @@ describe("Session Termination and Persistence", () => {
   function createMockSession(threadId: string): { session: MockSession; thread: MockThread } {
     const thread: MockThread = {
       id: threadId,
-      name: `thread-${threadId}`,
+      name: `thread-${ threadId }`,
       deleted: false,
       isThread: () => true,
       delete: async () => {
@@ -175,7 +175,7 @@ describe("Session Termination and Persistence", () => {
     const threadsMap = new Map<string, MockThread>();
 
     for (let i = 1; i <= 5; i++) {
-      const id = `thread_${i}`;
+      const id = `thread_${ i }`;
       const { session, thread } = createMockSession(id);
       sessionsMap.set(id, session);
       threadsMap.set(id, thread);

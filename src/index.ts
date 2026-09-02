@@ -88,7 +88,7 @@ const quickActionLastUsedAt = new Map<string, number>();
 const QUICK_ACTION_DEBOUNCE_MS = 750;
 
 function isUserAllowed(userId: string): boolean {
-  if (allowedUserIds.size === 0) return false;
+  if (allowedUserIds.size === 0) { return false; }
   return allowedUserIds.has(userId);
 }
 
@@ -139,14 +139,14 @@ async function getGitBranch(cwd: string): Promise<string | null> {
       stderr: "ignore",
     });
     const branch = (await new Response(branchProc.stdout).text()).trim();
-    if (branch && branch !== "HEAD") return branch;
+    if (branch && branch !== "HEAD") { return branch; }
 
     const commitProc = spawn(["git", "-c", "safe.directory=*", "rev-parse", "--short", "HEAD"], {
       cwd,
       stderr: "ignore",
     });
     const commit = (await new Response(commitProc.stdout).text()).trim();
-    return commit ? `detached@${commit}` : null;
+    return commit ? `detached@${ commit }` : null;
   } catch {
     return null;
   }
@@ -155,7 +155,7 @@ async function getGitBranch(cwd: string): Promise<string | null> {
 async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dirty: boolean | null }> {
   try {
     const branch = await getGitBranch(cwd);
-    if (!branch) return { branch: null, dirty: null };
+    if (!branch) {return { branch: null, dirty: null };}
     const statusProc = spawn(["git", "-c", "safe.directory=*", "status", "--porcelain"], {
       cwd,
       stderr: "ignore",
@@ -168,8 +168,8 @@ async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dir
 }
 
 function readNumericValue(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  if (typeof value === "number" && Number.isFinite(value)) { return value; }
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) { return Number(value); }
   return undefined;
 }
 
@@ -185,22 +185,22 @@ function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
 }
 
 function readModelDisplay(data: Record<string, unknown>): string | undefined {
-  if (typeof data.model === "string") return data.model;
-  if (!data.model || typeof data.model !== "object") return undefined;
+  if (typeof data.model === "string") { return data.model; }
+  if (!data.model || typeof data.model !== "object") { return undefined; }
   const model = data.model as Record<string, unknown>;
   const id = typeof model.id === "string" ? model.id : undefined;
   const name = typeof model.name === "string" ? model.name : undefined;
   const provider = typeof model.provider === "string" ? model.provider : undefined;
-  if (!id && !name) return undefined;
-  return `${provider ? `${provider}/` : ""}${id || name}${id && name ? ` (${name})` : ""}`;
+  if (!id && !name) { return undefined; }
+  return `${provider ? `${ provider }/` : ""}${ id || name }${id && name ? ` (${ name })` : ""}`;
 }
 
 function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
   const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
-  if (typeof raw === "number") return raw;
-  if (!Array.isArray(raw)) return undefined;
+  if (typeof raw === "number") { return raw; }
+  if (!Array.isArray(raw)) { return undefined; }
   return raw.map((agent) => {
-    if (typeof agent === "string") return agent;
+    if (typeof agent === "string") { return agent; }
     if (agent && typeof agent === "object") {
       const item = agent as Record<string, unknown>;
       return String(item.name ?? item.id ?? item.role ?? "subagent");
@@ -231,7 +231,7 @@ function mergeHudState(session: SessionContext, data: Record<string, unknown>, a
 }
 
 async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
-  if (session.hudMessage) return;
+  if (session.hudMessage) { return; }
   if (session.hudInitPromise) {
     await session.hudInitPromise;
     return;
@@ -243,32 +243,32 @@ async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): 
       const pinned = await thread.messages.fetchPinned().catch(() => null);
       const existing = pinned?.find((message) => message.embeds.some((embed) => embed.title === "📡 OMP Live HUD"));
       session.hudMessage = existing || await thread.send({ embeds: [formatHudEmbed(initialState)] });
-      if (!existing) await session.hudMessage.pin("OMP live observability HUD").catch(() => {});
+      if (!existing) {await session.hudMessage.pin("OMP live observability HUD").catch(() => {});}
       session.hudLastEditTimestamp = Date.now();
       scheduleHudUpdate(session, thread);
     } catch (error) {
-      console.warn(`Unable to create pinned HUD for thread ${thread.id}:`, error);
+      console.warn(`Unable to create pinned HUD for thread ${ thread.id }:`, error);
     }
   })();
   session.hudInitPromise = initialization;
   try {
     await initialization;
   } finally {
-    if (session.hudInitPromise === initialization) session.hudInitPromise = undefined;
+    if (session.hudInitPromise === initialization) { session.hudInitPromise = undefined; }
   }
 }
 
 async function flushHudUpdate(session: SessionContext): Promise<void> {
   clearTimeout(session.hudUpdateTimer);
   session.hudUpdateTimer = undefined;
-  if (!session.hudMessage) return;
+  if (!session.hudMessage) { return; }
   session.hudLastEditTimestamp = Date.now();
   await session.hudMessage.edit({ embeds: [formatHudEmbed((session.hudState || { cwd: session.cwd }) as HudState)] }).catch(() => {});
 }
 
 function scheduleHudUpdate(session: SessionContext, thread?: ThreadChannel): void {
   if (!session.hudMessage) {
-    if (thread) void ensurePinnedHud(session, thread);
+    if (thread) { void ensurePinnedHud(session, thread); }
     return;
   }
   const elapsed = Date.now() - (session.hudLastEditTimestamp || 0);
@@ -334,10 +334,10 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
     let gotModels = false;
 
     readline.on("line", (line: string) => {
-      if (!line.trim()) return;
+      if (!line.trim()) { return; }
       try {
         const frame: unknown = JSON.parse(line);
-        if (!frame || typeof frame !== "object") return;
+        if (!frame || typeof frame !== "object") { return; }
         const obj = frame as Record<string, unknown>;
 
         if (obj.type === "ready") {
@@ -366,7 +366,7 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
   await donePromise;
   proc.kill();
 
-  console.log(`Discovered ${fetchedCommands.length} native OMP commands and ${fetchedModels.length} models.`);
+  console.log(`Discovered ${ fetchedCommands.length } native OMP commands and ${ fetchedModels.length } models.`);
   return { commands: fetchedCommands, models: fetchedModels };
 }
 
@@ -574,10 +574,10 @@ function createOmpSession(
   const args = ["omp", "--mode", "rpc"];
   const resumeTarget = resolveOmpSessionPath(sessionFile, sessionId);
   if (resumeTarget) {
-    args.push(`--resume=${resumeTarget}`);
+    args.push(`--resume=${ resumeTarget }`);
   }
   if (initialModel) {
-    args.push(`--model=${initialModel}`);
+    args.push(`--model=${ initialModel }`);
   }
   const proc = spawn(args, {
     cwd,
@@ -633,7 +633,7 @@ function createOmpSession(
   });
 
   readline.on("line", (line: string) => {
-    if (!line.trim()) return;
+    if (!line.trim()) { return; }
     try {
       const event: unknown = JSON.parse(line);
       if (event && typeof event === "object") {
@@ -654,7 +654,7 @@ function createOmpSession(
     if (session.pendingRpcRequests) {
       for (const [, req] of session.pendingRpcRequests) {
         clearTimeout(req.timer);
-        req.reject(new Error(`OMP process exited with code ${code}`));
+        req.reject(new Error(`OMP process exited with code ${ code }`));
       }
       session.pendingRpcRequests.clear();
     }
@@ -663,7 +663,7 @@ function createOmpSession(
     session.toolTraces?.clear();
     session.toolTraceHistory = [];
     session.activePromptMsg = undefined;
-    void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
+    void thread.send(`⚠️ OMP process exited (code ${ code }).`).catch(() => {});
     void sessionManager.terminate(session, undefined, false);
   });
   return session;
@@ -674,11 +674,11 @@ async function terminateSession(session: SessionContext, deleteThread = true): P
 }
 
 async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
-  if (!isDefaultThreadName(thread.name)) return;
+  if (!isDefaultThreadName(thread.name)) { return; }
   const nextName = buildDynamicThreadName(prompt, thread.name, "idle");
-  if (nextName === thread.name) return;
+  if (nextName === thread.name) { return; }
   await thread.setName(nextName).catch((err) => {
-    console.warn(`Failed to derive a name for thread ${thread.id}:`, err);
+    console.warn(`Failed to derive a name for thread ${ thread.id }:`, err);
   });
 }
 
@@ -688,7 +688,7 @@ async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string)
 function formatToolStatus(toolName: string, rawArgs?: unknown, rawIntent?: unknown): string {
   const intent = typeof rawIntent === "string" ? rawIntent.trim() : "";
   if (intent) {
-    return `⚡ *${intent}* (\`${toolName}\`)`;
+    return `⚡ *${ intent }* (\`${ toolName }\`)`;
   }
 
   const args = (rawArgs && typeof rawArgs === "object" ? rawArgs : {}) as Record<string, unknown>;
@@ -696,32 +696,32 @@ function formatToolStatus(toolName: string, rawArgs?: unknown, rawIntent?: unkno
   if (toolName === "bash" && typeof args.command === "string") {
     const cmd = args.command.trim();
     const shortCmd = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
-    return `🔧 \`bash\`: \`${shortCmd}\``;
+    return `🔧 \`bash\`: \`${ shortCmd }\``;
   }
 
   if ((toolName === "read" || toolName === "write" || toolName === "edit") && typeof args.path === "string") {
-    return `📄 \`${toolName}\`: \`${args.path}\``;
+    return `📄 \`${ toolName }\`: \`${ args.path }\``;
   }
 
   if (toolName === "grep") {
     const pattern = typeof args.pattern === "string" ? args.pattern : "";
-    return `🔍 \`grep\`: \`${pattern}\``;
+    return `🔍 \`grep\`: \`${ pattern }\``;
   }
 
   if (toolName === "glob") {
     const pattern = typeof args.path === "string" ? args.path : "";
-    return `📂 \`glob\`: \`${pattern}\``;
+    return `📂 \`glob\`: \`${ pattern }\``;
   }
 
   if (toolName === "eval" && typeof args.title === "string") {
-    return `⚙️ \`eval\`: *${args.title}*`;
+    return `⚙️ \`eval\`: *${ args.title }*`;
   }
 
   if (toolName === "lsp" && typeof args.action === "string") {
-    return `🧠 \`lsp\`: *${args.action}*`;
+    return `🧠 \`lsp\`: *${ args.action }*`;
   }
 
-  return `🔧 *Running \`${toolName}\`...*`;
+  return `🔧 *Running \`${ toolName }\`...*`;
 }
 
 /**
@@ -789,8 +789,8 @@ function splitDiscordMessage(text: string, maxLength = 1950): string[] {
 
     if (currentFence !== null) {
       const fenceType = currentFence.startsWith("~") ? "~~~" : "```";
-      chunk += `\n${fenceType}`;
-      remaining = `${currentFence}\n` + remaining;
+      chunk += `\n${ fenceType }`;
+      remaining = `${ currentFence }\n` + remaining;
     }
 
     chunks.push(chunk);
@@ -807,7 +807,7 @@ async function flushActivePromptMessage(session: SessionContext): Promise<void> 
     clearTimeout(session.editTimer);
     session.editTimer = undefined;
   }
-  if (!session.activePromptMsg) return;
+  if (!session.activePromptMsg) { return; }
 
   session.lastEditTimestamp = Date.now();
 
@@ -868,7 +868,7 @@ function stopTyping(session: SessionContext): void {
  * Schedule throttled live update for Discord (~1 edit every 1.2s).
  */
 function scheduleActivePromptUpdate(session: SessionContext): void {
-  if (!session.activePromptMsg) return;
+  if (!session.activePromptMsg) { return; }
   const now = Date.now();
   const elapsed = now - session.lastEditTimestamp;
   const THROTTLE_MS = 1200;
@@ -888,7 +888,7 @@ function executionIdForEvent(event: Record<string, unknown>, toolName: string): 
   const candidate = event.executionId ?? event.toolExecutionId ?? event.toolCallId ?? event.callId ?? event.id;
   return typeof candidate === "string" || typeof candidate === "number"
     ? String(candidate)
-    : `${toolName}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    : `${ toolName }_${ Date.now().toString(36) }_${ Math.random().toString(36).slice(2, 6) }`;
 }
 
 function toolOutputFromEvent(event: Record<string, unknown>): unknown {
@@ -899,7 +899,7 @@ function toolExitCodeFromEvent(event: Record<string, unknown>): number | null | 
   const raw = event.exitCode ?? event.exit_status ?? event.code ?? (event.result && typeof event.result === "object"
     ? (event.result as Record<string, unknown>).exitCode
     : undefined);
-  if (raw === null) return null;
+  if (raw === null) { return null; }
   return readNumericValue(raw);
 }
 
@@ -935,7 +935,7 @@ async function handleToolExecutionStart(session: SessionContext, thread: ThreadC
   session.toolTraces.set(id, trace);
   session.toolTraceHistory.push(trace);
   session.activeToolStatus = formatToolStatus(toolName, trace.args, trace.intent);
-  updateHudActivity(session, thread, `${toolIcon(toolName)} ${toolName}`, "running");
+  updateHudActivity(session, thread, `${ toolIcon(toolName) } ${ toolName }`, "running");
   scheduleActivePromptUpdate(session);
 }
 
@@ -957,9 +957,9 @@ async function handleToolExecutionUpdate(session: SessionContext, thread: Thread
   }
   trace.phase = "updated";
   const output = formatToolOutputPreview(toolOutputFromEvent(event));
-  if (output) trace.outputPreview = output;
+  if (output) { trace.outputPreview = output; }
   session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
-  updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
+  updateHudActivity(session, thread, `${ toolIcon(trace.toolName) } ${ trace.toolName }`, "running");
   scheduleActivePromptUpdate(session);
 }
 
@@ -996,7 +996,7 @@ async function handleToolExecutionEnd(session: SessionContext, thread: ThreadCha
   updateHudActivity(
     session,
     thread,
-    nextRunningTrace ? `${toolIcon(nextRunningTrace.toolName)} ${nextRunningTrace.toolName}` : undefined,
+    nextRunningTrace ? `${ toolIcon(nextRunningTrace.toolName) } ${ nextRunningTrace.toolName }` : undefined,
     "running",
   );
 }
@@ -1060,7 +1060,7 @@ async function handleRpcEvent(
     }
 
     const errorText = typeof event.message === "string" ? event.message : "OMP reported a fatal error.";
-    await thread.send(`🔴 **OMP error:** ${errorText}`).catch(() => {});
+    await thread.send(`🔴 **OMP error:** ${ errorText }`).catch(() => {});
     return;
   }
 
@@ -1141,17 +1141,17 @@ async function handleRpcEvent(
       session.confirmationPending = true;
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(`approve_${id}`)
+          .setCustomId(`approve_${ id }`)
           .setLabel("Approve")
           .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
-          .setCustomId(`reject_${id}`)
+          .setCustomId(`reject_${ id }`)
           .setLabel("Deny")
           .setStyle(ButtonStyle.Danger),
       );
 
       const msg = await thread.send({
-        content: `⚠️ **Action Required**: ${messageText}`,
+        content: `⚠️ **Action Required**: ${ messageText }`,
         components: [row],
       });
       recordAssistantMessage(session, msg.id);
@@ -1192,8 +1192,8 @@ async function handleRpcEvent(
         await confirmation
           .update({
             content: approved
-              ? `✅ Approved by <@${confirmation.user.id}>`
-              : `❌ Denied by <@${confirmation.user.id}>`,
+              ? `✅ Approved by <@${ confirmation.user.id }>`
+              : `❌ Denied by <@${ confirmation.user.id }>`,
             components: [],
           })
           .catch(() => {});
@@ -1229,11 +1229,11 @@ async function handleRpcEvent(
 
     const trimmed = rawOutput.trim();
     if (trimmed) {
-      const formatted = trimmed.startsWith("```") ? trimmed : `\`\`\`\n${trimmed}\n\`\`\``;
+      const formatted = trimmed.startsWith("```") ? trimmed : `\`\`\`\n${ trimmed }\n\`\`\``;
       const chunks = splitDiscordMessage(formatted, 1900);
       for (const chunk of chunks) {
         const sent = await thread.send(chunk).catch(() => null);
-        if (sent) recordAssistantMessage(session, sent.id);
+        if (sent) { recordAssistantMessage(session, sent.id); }
       }
     }
     return;
@@ -1253,7 +1253,7 @@ async function handleRpcEvent(
         sessionId: session.sessionId,
         sessionFile: session.sessionFile,
       }).catch((err) => {
-        console.error(`Failed to update session binding info for thread ${session.threadId}:`, err);
+        console.error(`Failed to update session binding info for thread ${ session.threadId }:`, err);
       });
     }
 
@@ -1270,7 +1270,7 @@ async function handleRpcEvent(
 
     if (event.id === "status_req") {
       const model = data.model as { provider?: string; id?: string; name?: string } | undefined;
-      const modelStr = model ? `${model.provider ? `${model.provider}/` : ""}${model.id}${model.name ? ` (${model.name})` : ""}` : "unknown";
+      const modelStr = model ? `${model.provider ? `${ model.provider }/` : ""}${ model.id }${model.name ? ` (${ model.name })` : ""}` : "unknown";
       const tokens = (data.contextUsage as { tokens?: number; contextWindow?: number; percent?: number }) || {};
 
       const [advisorConfig, branch] = await Promise.all([
@@ -1279,26 +1279,26 @@ async function handleRpcEvent(
       ]);
 
       const advisorText = advisorConfig.enabled
-        ? `🟢 On${advisorConfig.model ? ` (\`${advisorConfig.model}\`)` : ""}`
+        ? `🟢 On${advisorConfig.model ? ` (\`${ advisorConfig.model }\`)` : ""}`
         : "🔴 Off";
-      const branchText = branch ? `\`${branch}\`` : "*None*";
+      const branchText = branch ? `\`${ branch }\`` : "*None*";
 
       const embed = new EmbedBuilder()
         .setTitle("📊 OMP Session Status")
         .setColor(0x5865f2)
         .addFields(
-          { name: "🤖 Model", value: `\`${modelStr}\``, inline: true },
-          { name: "🧠 Thinking Level", value: `\`${String(data.thinkingLevel || "normal")}\``, inline: true },
+          { name: "🤖 Model", value: `\`${ modelStr }\``, inline: true },
+          { name: "🧠 Thinking Level", value: `\`${ String(data.thinkingLevel || "normal") }\``, inline: true },
           { name: "⚡ Fast Mode", value: data.fastModeActive ? "⚡ Active" : "Off", inline: true },
           { name: "🛡️ Advisor", value: advisorText, inline: true },
           { name: "🌿 Git Branch", value: branchText, inline: true },
           {
             name: "Context Usage",
-            value: tokens.tokens != null ? `${tokens.tokens.toLocaleString()} / ${tokens.contextWindow?.toLocaleString()} (${Math.round((tokens.percent || 0) * 100)}%)` : "N/A",
+            value: tokens.tokens != null ? `${ tokens.tokens.toLocaleString() } / ${ tokens.contextWindow?.toLocaleString() } (${ Math.round((tokens.percent || 0) * 100) }%)` : "N/A",
             inline: true,
           },
-          { name: "📁 Directory", value: `\`${session.cwd}\``, inline: false },
-          { name: "💬 Messages", value: `${data.messageCount ?? 0} in session`, inline: true },
+          { name: "📁 Directory", value: `\`${ session.cwd }\``, inline: false },
+          { name: "💬 Messages", value: `${ data.messageCount ?? 0 } in session`, inline: true },
         );
 
       await thread.send({ embeds: [embed] }).catch(() => {});
@@ -1353,14 +1353,14 @@ async function handleRpcEvent(
         .catch(() => {});
       for (let i = 1; i < chunks.length; i++) {
         const extraMsg = await thread.send(chunks[i]).catch(() => null);
-        if (extraMsg) recordAssistantMessage(session, extraMsg.id);
+        if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
       }
     } else {
       const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
-      if (firstMsg) recordAssistantMessage(session, firstMsg.id);
+      if (firstMsg) { recordAssistantMessage(session, firstMsg.id); }
       for (let i = 1; i < chunks.length; i++) {
         const extraMsg = await thread.send(chunks[i]).catch(() => null);
-        if (extraMsg) recordAssistantMessage(session, extraMsg.id);
+        if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
       }
     }
 
@@ -1379,7 +1379,7 @@ async function handleRpcEvent(
     updateHudActivity(session, thread, undefined, "idle");
 
     // Sync checkpoint entryIds with OMP transcript
-    sendRpc(session, { id: `sync_branch_${Date.now()}`, type: "get_branch_messages" });
+    sendRpc(session, { id: `sync_branch_${ Date.now() }`, type: "get_branch_messages" });
     return;
   }
 
@@ -1427,15 +1427,15 @@ async function handleRpcEvent(
           .catch(() => {});
         for (let i = 1; i < chunks.length; i++) {
           const extraMsg = await thread.send(chunks[i]).catch(() => null);
-          if (extraMsg) recordAssistantMessage(session, extraMsg.id);
+          if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
         }
         session.activePromptMsg = undefined;
       } else {
         const firstMsg = await thread.send({ content: chunks[0], components }).catch(() => null);
-        if (firstMsg) recordAssistantMessage(session, firstMsg.id);
+        if (firstMsg) { recordAssistantMessage(session, firstMsg.id); }
         for (let i = 1; i < chunks.length; i++) {
           const extraMsg = await thread.send(chunks[i]).catch(() => null);
-          if (extraMsg) recordAssistantMessage(session, extraMsg.id);
+          if (extraMsg) { recordAssistantMessage(session, extraMsg.id); }
         }
       }
       session.completionBarAttached = true;
@@ -1446,7 +1446,7 @@ async function handleRpcEvent(
     updateHudActivity(session, thread, undefined, "idle");
 
     // Sync checkpoint entryIds with OMP transcript
-    sendRpc(session, { id: `sync_branch_${Date.now()}`, type: "get_branch_messages" });
+    sendRpc(session, { id: `sync_branch_${ Date.now() }`, type: "get_branch_messages" });
   }
 }
 
@@ -1456,7 +1456,7 @@ function getModelSuggestions(queryRaw: string): Array<{ name: string; value: str
     .filter((m) => m.id.toLowerCase().includes(query) || (m.name && m.name.toLowerCase().includes(query)))
     .slice(0, 25)
     .map((m) => ({
-      name: `${m.name || m.id} [${m.provider || "omp"}] (${Math.round((m.contextWindow || 0) / 1000)}k ctx)`.slice(0, 100),
+      name: `${ m.name || m.id } [${ m.provider || "omp" }] (${ Math.round((m.contextWindow || 0) / 1000) }k ctx)`.slice(0, 100),
       value: m.id,
     }));
 }
@@ -1473,7 +1473,7 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
 
     if (!rawInput) {
       suggestions.push({
-        name: `📁 . (Root: ${basename(rootDir) || rootDir})`,
+        name: `📁 . (Root: ${ basename(rootDir) || rootDir })`,
         value: ".",
       });
       if (existsSync(rootDir)) {
@@ -1481,7 +1481,7 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
         for (const entry of entries) {
           if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
             suggestions.push({
-              name: `📁 ${entry.name}/`,
+              name: `📁 ${ entry.name }/`,
               value: entry.name,
             });
           }
@@ -1511,26 +1511,26 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
     if (existsSync(searchDir) && statSync(searchDir).isDirectory()) {
       if (searchDir === targetPath && existsSync(targetPath)) {
         suggestions.push({
-          name: `📁 ${rawInput} (current)`,
+          name: `📁 ${ rawInput } (current)`,
           value: rawInput,
         });
       }
 
       const entries = readdirSync(searchDir, { withFileTypes: true });
       for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !filePrefix.startsWith(".") && filePrefix !== "node_modules") continue;
-        if (filePrefix && !entry.name.toLowerCase().startsWith(filePrefix)) continue;
+        if (!entry.isDirectory()) { continue; }
+        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !filePrefix.startsWith(".") && filePrefix !== "node_modules") { continue; }
+        if (filePrefix && !entry.name.toLowerCase().startsWith(filePrefix)) { continue; }
 
         let val: string;
         if (isAbs) {
           val = join(searchDir, entry.name);
         } else {
           const relToRoot = relative(rootDir, join(searchDir, entry.name));
-          val = relToRoot.startsWith(".") ? relToRoot : `./${relToRoot}`;
+          val = relToRoot.startsWith(".") ? relToRoot : `./${ relToRoot }`;
         }
         suggestions.push({
-          name: `📁 ${entry.name}/ (${val})`.slice(0, 100),
+          name: `📁 ${ entry.name }/ (${ val })`.slice(0, 100),
           value: val.slice(0, 100),
         });
       }
@@ -1571,7 +1571,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
       .filter((file) => interaction.commandName === "diff" || isDownloadableWorkspaceFile(file))
       .slice(0, 25)
       .map((file) => ({
-        name: `${file.relativePath} (${file.size} bytes)`.slice(0, 100),
+        name: `${ file.relativePath } (${ file.size } bytes)`.slice(0, 100),
         value: file.relativePath.slice(0, 100),
       }));
     await interaction.respond(suggestions);
@@ -1584,7 +1584,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
       .filter((s) => s.name.toLowerCase().includes(query) || s.description.toLowerCase().includes(query))
       .slice(0, 25)
       .map((s) => ({
-        name: `$${s.name} — ${s.description.slice(0, 80)}`,
+        name: `$${ s.name } — ${ s.description.slice(0, 80) }`,
         value: s.name,
       }));
     await interaction.respond(filtered);
@@ -1598,7 +1598,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
       .filter((c) => c.name.toLowerCase().includes(query) || (c.description && c.description.toLowerCase().includes(query)))
       .slice(0, 25)
       .map((c) => ({
-        name: `/${c.name} ${c.input?.hint || ""} ${c.description ? `(${c.description.slice(0, 60)})` : ""}`.trim().slice(0, 100),
+        name: `/${ c.name } ${ c.input?.hint || "" } ${c.description ? `(${ c.description.slice(0, 60) })` : ""}`.trim().slice(0, 100),
         value: c.name,
       }));
     await interaction.respond(filtered);
@@ -1626,7 +1626,7 @@ async function handleQuickAction(interaction: ButtonInteraction): Promise<void> 
     return;
   }
 
-  const debounceKey = `${interaction.user.id}:${interaction.customId}`;
+  const debounceKey = `${ interaction.user.id }:${ interaction.customId }`;
   const now = Date.now();
   const lastUsedAt = quickActionLastUsedAt.get(debounceKey) || 0;
   if (now - lastUsedAt < QUICK_ACTION_DEBOUNCE_MS) {
@@ -1639,11 +1639,11 @@ async function handleQuickAction(interaction: ButtonInteraction): Promise<void> 
   try {
     switch (parsed.action) {
       case "undo":
-        sendRpc(session, { id: `undo_${Date.now()}`, type: "prompt", message: "/undo" });
+        sendRpc(session, { id: `undo_${ Date.now() }`, type: "prompt", message: "/undo" });
         await interaction.editReply("↩️ Undo requested.");
         break;
       case "compact":
-        sendRpc(session, { id: `compact_${Date.now()}`, type: "compact" });
+        sendRpc(session, { id: `compact_${ Date.now() }`, type: "compact" });
         await interaction.editReply("🗜️ Context compaction triggered.");
         break;
       case "abort":
@@ -1651,7 +1651,7 @@ async function handleQuickAction(interaction: ButtonInteraction): Promise<void> 
           await interaction.editReply("ℹ️ No active turn to abort.");
           break;
         }
-        sendRpc(session, { id: `abort_${Date.now()}`, type: "abort" });
+        sendRpc(session, { id: `abort_${ Date.now() }`, type: "abort" });
         await interaction.editReply("⏹️ Turn abort requested.");
         break;
       case "status":
@@ -1661,7 +1661,7 @@ async function handleQuickAction(interaction: ButtonInteraction): Promise<void> 
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await interaction.editReply(`❌ Action failed: ${message}`).catch(() => {});
+    await interaction.editReply(`❌ Action failed: ${ message }`).catch(() => {});
   }
 }
 
@@ -1691,7 +1691,7 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.isChatInputCommand()) { return; }
 
   // New Session
   if (interaction.commandName === "omp-new") {
@@ -1718,7 +1718,7 @@ client.on("interactionCreate", async (interaction) => {
 
     if (!isInsideWorkspace(cwd, normalizedRoot)) {
       await interaction.reply({
-        content: `⛔ Access denied: Directory must be inside the workspace root (\`${normalizedRoot}\`).`,
+        content: `⛔ Access denied: Directory must be inside the workspace root (\`${ normalizedRoot }\`).`,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -1726,13 +1726,13 @@ client.on("interactionCreate", async (interaction) => {
 
     if (!existsSync(cwd)) {
       await interaction.reply({
-        content: `❌ Directory \`${cwd}\` does not exist. Please specify a valid directory.`,
+        content: `❌ Directory \`${ cwd }\` does not exist. Please specify a valid directory.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const sessionId = Math.random().toString(36).slice(2, 8);
-    const threadName = `omp-session-${sessionId}`;
+    const threadName = `omp-session-${ sessionId }`;
     await interaction.deferReply();
 
     let createdWorktree: WorktreeInfo | undefined;
@@ -1794,17 +1794,17 @@ client.on("interactionCreate", async (interaction) => {
 
       const modelData = (state?.model as { id?: string; name?: string; provider?: string } | undefined) || {};
       const modelDisplay = modelData.id
-        ? `${modelData.provider ? `${modelData.provider}/` : ""}${modelData.id}${modelData.name ? ` (${modelData.name})` : ""}`
+        ? `${modelData.provider ? `${ modelData.provider }/` : ""}${ modelData.id }${modelData.name ? ` (${ modelData.name })` : ""}`
         : (inputModel || "default");
 
       const thinkingLevel = typeof state?.thinkingLevel === "string" ? state.thinkingLevel : "normal";
       const fastMode = Boolean(state?.fastModeActive);
 
       const advisorText = advisorConfig.enabled
-        ? `🟢 On${advisorConfig.model ? ` (\`${advisorConfig.model}\`)` : ""}`
+        ? `🟢 On${advisorConfig.model ? ` (\`${ advisorConfig.model }\`)` : ""}`
         : "🔴 Off";
 
-      const branchText = branch ? `\`${branch}\`` : "*None (not a git repo)*";
+      const branchText = branch ? `\`${ branch }\`` : "*None (not a git repo)*";
 
       const sessionEmbed = new EmbedBuilder()
         .setTitle("👋 OMP Session Active")
@@ -1813,16 +1813,16 @@ client.on("interactionCreate", async (interaction) => {
           "Type directly in this thread to prompt the agent, or use slash commands (`/skill`, `/cmd`, `/model`, `/fast`, `/think`, `/compact`, `/status`, `/abort`).",
         )
         .addFields(
-          { name: "🤖 Active Model", value: `\`${modelDisplay}\``, inline: true },
+          { name: "🤖 Active Model", value: `\`${ modelDisplay }\``, inline: true },
           { name: "🛡️ Advisor", value: advisorText, inline: true },
           { name: "🌿 Git Branch", value: branchText, inline: true },
-          { name: "📁 Working Directory", value: `\`${sessionCwd}\``, inline: false },
+          { name: "📁 Working Directory", value: `\`${ sessionCwd }\``, inline: false },
           { name: "⚡ Fast Mode", value: fastMode ? "⚡ Active" : "Off", inline: true },
         )
         .setTimestamp();
 
       await interaction.editReply(
-        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${sessionCwd}\`${createdWorktree ? `\n🌿 Isolated branch: \`${createdWorktree.branch}\`` : ""}\n🤖 Model: \`${modelDisplay}\``,
+        `🚀 Session started in <#${ thread.id }>\n📁 Directory: \`${ sessionCwd }\`${createdWorktree ? `\n🌿 Isolated branch: \`${ createdWorktree.branch }\`` : ""}\n🤖 Model: \`${ modelDisplay }\``,
       );
       await thread.send({
         embeds: [sessionEmbed],
@@ -1832,7 +1832,7 @@ client.on("interactionCreate", async (interaction) => {
         await removeGitWorktree(createdWorktree);
       }
       const errorMsg = err instanceof Error ? err.message : String(err);
-      await interaction.editReply(`Failed to start session: ${errorMsg}`);
+      await interaction.editReply(`Failed to start session: ${ errorMsg }`);
     }
     return;
   }
@@ -1849,12 +1849,12 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply();
-    console.log(`🛑 /omp-terminate-all requested: Terminating ${count} active session(s)...`);
+    console.log(`🛑 /omp-terminate-all requested: Terminating ${ count } active session(s)...`);
 
     await sessionManager.terminateAll(client, true);
     try {
       await interaction.editReply(
-        `🛑 Successfully terminated ${count} active OMP session${count === 1 ? "" : "s"} and deleted associated Discord thread${count === 1 ? "" : "s"}.`,
+        `🛑 Successfully terminated ${ count } active OMP session${ count === 1 ? "" : "s" } and deleted associated Discord thread${ count === 1 ? "" : "s" }.`,
       );
     } catch {
       // Channel might have been deleted if command was run inside one of the terminated threads
@@ -1878,25 +1878,25 @@ client.on("interactionCreate", async (interaction) => {
     const pathFilter = interaction.options.getString("path") || undefined;
     const result = await inspectGitDiff(session.cwd, { staged, path: pathFilter });
     if (result.error) {
-      await interaction.reply(`❌ ${result.error}`);
+      await interaction.reply(`❌ ${ result.error }`);
       return;
     }
-    const scope = result.path ? ` for \`${result.path}\`` : "";
+    const scope = result.path ? ` for \`${ result.path }\`` : "";
     if (!result.hasChanges) {
-      await interaction.reply(`ℹ️ No ${staged ? "staged" : "unstaged"} changes${scope} found in this workspace.`);
+      await interaction.reply(`ℹ️ No ${ staged ? "staged" : "unstaged" } changes${ scope } found in this workspace.`);
       return;
     }
     const summaryEmbed = new EmbedBuilder()
-      .setTitle(`${staged ? "Staged" : "Unstaged"} Git Changes`)
+      .setTitle(`${ staged ? "Staged" : "Unstaged" } Git Changes`)
       .setColor(0x2f80ed)
       .addFields(
         { name: "Summary", value: result.summary || "Changed files detected.", inline: false },
-        ...(result.stat.trim() ? [{ name: "Diff stat", value: `\`\`\`\n${result.stat.trim().slice(0, 900)}\n\`\`\``, inline: false }] : []),
+        ...(result.stat.trim() ? [{ name: "Diff stat", value: `\`\`\`\n${ result.stat.trim().slice(0, 900) }\n\`\`\``, inline: false }] : []),
       )
       .setTimestamp();
     if (!result.hasDiff) {
       await interaction.reply({
-        content: `ℹ️ Git reports changes${scope}, but there is no ${staged ? "staged" : "unstaged"} patch to display (for example, an untracked file).`,
+        content: `ℹ️ Git reports changes${ scope }, but there is no ${ staged ? "staged" : "unstaged" } patch to display (for example, an untracked file).`,
         embeds: [summaryEmbed],
       });
       return;
@@ -1919,12 +1919,12 @@ client.on("interactionCreate", async (interaction) => {
     const requestedPath = interaction.options.getString("path", true);
     const result = resolveWorkspaceFile(session.cwd, requestedPath);
     if (!result.ok || !result.file) {
-      await interaction.reply({ content: `❌ ${result.error || "Unable to resolve that file."}`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `❌ ${ result.error || "Unable to resolve that file." }`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (!isDownloadableWorkspaceFile(result.file)) {
       await interaction.reply({
-        content: `❌ That file is ${Math.ceil(result.file.size / (1024 * 1024))}MB, which exceeds Discord's 25MB attachment limit.`,
+        content: `❌ That file is ${ Math.ceil(result.file.size / (1024 * 1024)) }MB, which exceeds Discord's 25MB attachment limit.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -1936,7 +1936,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
       await interaction.reply({
-        content: `📎 Downloading \`${result.file.relativePath}\` (${contents.byteLength} bytes).`,
+        content: `📎 Downloading \`${ result.file.relativePath }\` (${ contents.byteLength } bytes).`,
         files: [{ attachment: contents, name: basename(result.file.relativePath) }],
       });
     } catch {
@@ -1951,11 +1951,11 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferReply();
     const result = await commitWorkspaceChanges(session.cwd, message);
     if (result.error) {
-      await interaction.editReply(`❌ ${result.error}`);
+      await interaction.editReply(`❌ ${ result.error }`);
     } else if (!result.committed) {
       await interaction.editReply("ℹ️ There are no staged or tracked changes to commit.");
     } else {
-      await interaction.editReply(`✅ Committed workspace changes${result.hash ? ` as \`${result.hash}\`` : ""}.`);
+      await interaction.editReply(`✅ Committed workspace changes${result.hash ? ` as \`${ result.hash }\`` : ""}.`);
     }
     return;
   }
@@ -1963,14 +1963,14 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "skill") {
     const skillName = interaction.options.getString("name", true);
     const prompt = interaction.options.getString("prompt", true);
-    const fullPrompt = `$${skillName} ${prompt}`;
+    const fullPrompt = `$${ skillName } ${ prompt }`;
 
     if (interaction.channel?.isThread()) {
       startTyping(session, interaction.channel);
     }
-    await interaction.reply(`🎯 Invoking skill \`$${skillName}\`...`);
+    await interaction.reply(`🎯 Invoking skill \`$${ skillName }\`...`);
     sendRpc(session, {
-      id: `skill_${Date.now()}`,
+      id: `skill_${ Date.now() }`,
       type: "prompt",
       message: fullPrompt,
     });
@@ -1981,14 +1981,14 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "cmd") {
     const cmdName = interaction.options.getString("command", true);
     const args = interaction.options.getString("args") || "";
-    const fullCommand = `/${cmdName} ${args}`.trim();
+    const fullCommand = `/${ cmdName } ${ args }`.trim();
 
     if (interaction.channel?.isThread()) {
       startTyping(session, interaction.channel);
     }
-    await interaction.reply(`⚡ Running command \`${fullCommand}\`...`);
+    await interaction.reply(`⚡ Running command \`${ fullCommand }\`...`);
     sendRpc(session, {
-      id: `cmd_${Date.now()}`,
+      id: `cmd_${ Date.now() }`,
       type: "prompt",
       message: fullCommand,
     });
@@ -2000,11 +2000,11 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "model") {
     const selection = interaction.options.getString("selection");
     if (selection) {
-      await interaction.reply(`🔄 Switching model to \`${selection}\`...`);
+      await interaction.reply(`🔄 Switching model to \`${ selection }\`...`);
       sendRpc(session, {
-        id: `model_${Date.now()}`,
+        id: `model_${ Date.now() }`,
         type: "prompt",
-        message: `/model ${selection}`,
+        message: `/model ${ selection }`,
       });
     } else {
       await interaction.reply(`🔍 Fetching current model...`);
@@ -2021,7 +2021,7 @@ client.on("interactionCreate", async (interaction) => {
       sendRpc(session, { id: "fast_status", type: "prompt", message: "/fast status" });
     } else {
       const enabled = mode === "on";
-      await interaction.reply(`⚡ Setting fast mode to \`${mode}\`...`);
+      await interaction.reply(`⚡ Setting fast mode to \`${ mode }\`...`);
       sendRpc(session, { id: "fast_set", type: "set_fast_mode", enabled });
     }
     return;
@@ -2030,7 +2030,7 @@ client.on("interactionCreate", async (interaction) => {
   // /think [level]
   if (interaction.commandName === "think") {
     const level = interaction.options.getString("level", true);
-    await interaction.reply(`🧠 Setting thinking level to \`${level}\`...`);
+    await interaction.reply(`🧠 Setting thinking level to \`${ level }\`...`);
     sendRpc(session, { id: "think_set", type: "set_thinking_level", level });
     return;
   }
@@ -2087,35 +2087,35 @@ async function processImageAttachment(
   att: { url: string; contentType?: string | null; name?: string | null; size?: number },
 ): Promise<ImagePayload | null> {
   if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
-    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    console.warn(`Attachment ${ att.name || "unnamed" } exceeds max size limit (${ att.size } > ${ MAX_ATTACHMENT_SIZE_BYTES } bytes).`);
     return null;
   }
   try {
     const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
-      console.error(`Failed to download image attachment ${att.name || "unnamed"} (status ${res.status})`);
+      console.error(`Failed to download image attachment ${ att.name || "unnamed" } (status ${ res.status })`);
       return null;
     }
     const contentLength = Number(res.headers.get("content-length"));
     if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
-      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      console.warn(`Image attachment ${ att.name || "unnamed" } exceeds size limit (${ contentLength } bytes).`);
       return null;
     }
     const arrayBuf = await res.arrayBuffer();
     if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
-      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      console.warn(`Image attachment ${ att.name || "unnamed" } exceeds size limit (${ arrayBuf.byteLength } bytes).`);
       return null;
     }
     const base64 = Buffer.from(arrayBuf).toString("base64");
     let mimeType = att.contentType || "";
     if (!mimeType || !mimeType.startsWith("image/")) {
       const ext = (att.name || "").split(".").pop()?.toLowerCase();
-      if (ext === "png") mimeType = "image/png";
-      else if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
-      else if (ext === "webp") mimeType = "image/webp";
-      else if (ext === "gif") mimeType = "image/gif";
-      else if (ext === "bmp") mimeType = "image/bmp";
-      else mimeType = "image/png";
+      if (ext === "png") { mimeType = "image/png"; }
+      else if (ext === "jpg" || ext === "jpeg") { mimeType = "image/jpeg"; }
+      else if (ext === "webp") { mimeType = "image/webp"; }
+      else if (ext === "gif") { mimeType = "image/gif"; }
+      else if (ext === "bmp") { mimeType = "image/bmp"; }
+      else { mimeType = "image/png"; }
     }
     return {
       type: "image",
@@ -2123,7 +2123,7 @@ async function processImageAttachment(
       mimeType,
     };
   } catch (err) {
-    console.error(`Error processing image attachment ${att.name || "unnamed"}:`, err);
+    console.error(`Error processing image attachment ${ att.name || "unnamed" }:`, err);
     return null;
   }
 }
@@ -2146,23 +2146,23 @@ async function saveNonImageAttachment(
   att: { url: string; name?: string | null; size?: number },
 ): Promise<string | null> {
   if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
-    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    console.warn(`Attachment ${ att.name || "unnamed" } exceeds max size limit (${ att.size } > ${ MAX_ATTACHMENT_SIZE_BYTES } bytes).`);
     return null;
   }
   try {
     const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
-      console.error(`Failed to download attachment ${att.name || "unnamed"} (status ${res.status})`);
+      console.error(`Failed to download attachment ${ att.name || "unnamed" } (status ${ res.status })`);
       return null;
     }
     const contentLength = Number(res.headers.get("content-length"));
     if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
-      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      console.warn(`Attachment ${ att.name || "unnamed" } exceeds size limit (${ contentLength } bytes).`);
       return null;
     }
     const arrayBuf = await res.arrayBuffer();
     if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
-      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      console.warn(`Attachment ${ att.name || "unnamed" } exceeds size limit (${ arrayBuf.byteLength } bytes).`);
       return null;
     }
     const dir = getAttachmentDir(session, messageId);
@@ -2172,7 +2172,7 @@ async function saveNonImageAttachment(
     writeFileSync(targetPath, Buffer.from(arrayBuf));
     return targetPath;
   } catch (err) {
-    console.error(`Error saving non-image attachment ${att.name || "unnamed"}:`, err);
+    console.error(`Error saving non-image attachment ${ att.name || "unnamed" }:`, err);
     return null;
   }
 }
@@ -2190,18 +2190,18 @@ async function extractMessagePrompt(
       const isImage = (att.contentType?.startsWith("image/") ?? false) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(att.name || "");
       if (isImage) {
         const img = await processImageAttachment(att);
-        if (img) images.push(img);
+        if (img) { images.push(img); }
       } else {
         const filePath = await saveNonImageAttachment(session, message.id, att);
-        if (filePath) savedFilePaths.push(filePath);
+        if (filePath) { savedFilePaths.push(filePath); }
       }
     }
   }
 
   let text = message.content.trim();
   if (savedFilePaths.length > 0) {
-    const fileRefs = savedFilePaths.map((p) => `@${p}`).join(" ");
-    text = text ? `${fileRefs} ${text}` : fileRefs;
+    const fileRefs = savedFilePaths.map((p) => `@${ p }`).join(" ");
+    text = text ? `${ fileRefs } ${ text }` : fileRefs;
   }
 
   return { text, images };
@@ -2209,10 +2209,10 @@ async function extractMessagePrompt(
 
 // Handle Chat Messages in Threads
 client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!isUserAllowed(message.author.id)) return;
+  if (message.author.bot) { return; }
+  if (!isUserAllowed(message.author.id)) { return; }
   const session = sessionManager.get(message.channelId);
-  if (!session) return;
+  if (!session) { return; }
   if (session.isRewinding) {
     await message.reply("⏳ *Session is currently rewinding. Please wait a moment before sending new messages.*").catch(() => {});
     return;
@@ -2237,7 +2237,7 @@ client.on("messageCreate", async (message) => {
   void persistSessionCheckpoints(session, sessionManager);
 
   sendRpc(session, {
-    id: `prompt_${Date.now()}`,
+    id: `prompt_${ Date.now() }`,
     type: "prompt",
     message: text,
     ...(images.length > 0 ? { images } : {}),
@@ -2258,41 +2258,41 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
 
 // Handle Message Reaction Shortcuts
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
-  if (user.bot || !isUserAllowed(user.id)) return;
+  if (user.bot || !isUserAllowed(user.id)) { return; }
 
   const resolvedReaction = reaction.partial ? await reaction.fetch().catch(() => null) : reaction;
-  if (!resolvedReaction) return;
+  if (!resolvedReaction) { return; }
   const shortcut = parseReactionShortcut(resolvedReaction.emoji.name);
-  if (!shortcut) return;
+  if (!shortcut) { return; }
 
   const channel = resolvedReaction.message.channel;
-  if (!channel.isThread()) return;
+  if (!channel.isThread()) { return; }
   const session = sessionManager.get(channel.id);
-  if (!session) return;
+  if (!session) { return; }
 
   if (shortcut === "abort") {
     if (session.isRunning === false) {
       await channel.send("ℹ️ No active turn to abort.").catch(() => {});
       return;
     }
-    sendRpc(session, { id: `reaction_abort_${Date.now()}`, type: "abort" });
-    await channel.send(`⏹️ Turn abort requested by <@${user.id}>.`).catch(() => {});
+    sendRpc(session, { id: `reaction_abort_${ Date.now() }`, type: "abort" });
+    await channel.send(`⏹️ Turn abort requested by <@${ user.id }>.`).catch(() => {});
   } else {
-    sendRpc(session, { id: `reaction_undo_${Date.now()}`, type: "prompt", message: "/undo" });
-    await channel.send(`↩️ Undo requested by <@${user.id}>.`).catch(() => {});
+    sendRpc(session, { id: `reaction_undo_${ Date.now() }`, type: "prompt", message: "/undo" });
+    await channel.send(`↩️ Undo requested by <@${ user.id }>.`).catch(() => {});
   }
 });
 
 // Handle Thread Deletions to clean up OMP processes automatically
 client.on(Events.ThreadDelete, (thread) => {
-  console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
+  console.log(`🗑️ Thread ${ thread.id } ("${ thread.name }") deleted. Terminating OMP session...`);
   void sessionManager.terminate(thread.id, client, false);
 });
 
 client.on(Events.ClientReady, async () => {
-  console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
+  console.log(`🤖 OMP Discord Bot is online as ${ client.user?.tag }!`);
   if (allowedUserIds.size > 0) {
-    console.log(`🔒 User allowlist active: ${allowedUserIds.size} allowed user(s).`);
+    console.log(`🔒 User allowlist active: ${ allowedUserIds.size } allowed user(s).`);
   } else {
     console.warn("⚠️ WARNING: No ALLOWED_USERS configured! All user interactions are blocked (fail-closed). Add Discord user IDs to ALLOWED_USERS in .env.");
   }

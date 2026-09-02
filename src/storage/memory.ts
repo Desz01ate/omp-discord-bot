@@ -11,7 +11,7 @@ export class InMemorySessionStore implements SessionStore {
   public async get(threadId: string): Promise<SessionBinding | null> {
     this.ensureInitialized();
     const item = this.store.get(threadId);
-    if (!item) return null;
+    if (!item) { return null; }
     return { ...item, metadata: item.metadata ? { ...item.metadata } : undefined };
   }
 
