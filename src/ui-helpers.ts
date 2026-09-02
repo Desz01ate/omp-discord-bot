@@ -67,7 +67,8 @@ export function getThreadStatusEmoji(status: ThreadStatus): string {
 
 /** Return true for names that have not yet been customized for a prompt. */
 export function isDefaultThreadName(name: string): boolean {
-  return /^omp-session-[^\s]+$/iu.test(name.trim());
+  const clean = name.trim().replace(STATUS_PREFIX, "").trim();
+  return /^omp-session-[^\s]+$/iu.test(clean);
 }
 
 /** Extract a compact, human-readable topic and optional OMX skill label from a prompt. */
@@ -99,8 +100,10 @@ export function extractPromptTopic(prompt: string): { topic: string; skill?: str
 export function buildDynamicThreadName(prompt: string, currentName: string, status: ThreadStatus = "running"): string {
   if (!isDefaultThreadName(currentName)) return currentName;
   const { topic, skill } = extractPromptTopic(prompt);
-  const label = skill ? ` [${skill}]` : "";
-  return `${getThreadStatusEmoji(status)}${label} ${topic}`.trim().slice(0, 100);
+  const label = skill ? `[${skill}] ` : "";
+  const prefix = getThreadStatusEmoji(status);
+  const combined = `${prefix} ${label}${topic}`.trim();
+  return combined.length <= 100 ? combined : `${combined.slice(0, 97)}...`;
 }
 
 /** Replace a prior status prefix while preserving the user's thread topic. */

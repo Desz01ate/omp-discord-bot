@@ -51,10 +51,12 @@ describe("interactive UI helpers", () => {
 
   it("renames only generated defaults and bounds names to Discord's limit", () => {
     expect(isDefaultThreadName("omp-session-a1b2")).toBe(true);
+    expect(isDefaultThreadName("🟢 omp-session-a1b2")).toBe(true);
+    expect(isDefaultThreadName("🟡 omp-session-xyz")).toBe(true);
     expect(isDefaultThreadName("🟢 Fix auth bug")).toBe(false);
     expect(buildDynamicThreadName("$ralph Fix auth bug", "omp-session-a1b2")).toBe("🟡 [ralph] Fix auth bug");
+    expect(buildDynamicThreadName("$ralph Fix auth bug", "🟢 omp-session-a1b2")).toBe("🟡 [ralph] Fix auth bug");
     expect(buildDynamicThreadName("Fix auth bug", "custom topic")).toBe("custom topic");
-
     const longName = updateThreadStatusName("omp-session-a1b2", "error");
     expect(longName.startsWith("🔴 ")).toBe(true);
     expect(longName.length).toBeLessThanOrEqual(100);

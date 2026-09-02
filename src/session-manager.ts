@@ -6,7 +6,7 @@ import type { Subprocess } from "bun";
 import type { SessionStore, SessionBinding } from "./storage";
 import { createSessionStore } from "./storage";
 import { removeGitWorktree, type WorktreeInfo } from "./workspace";
-import type { ToolExecutionTrace, VisualArtifact } from "./observability";
+import type { ToolExecutionTrace } from "./observability";
 
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
@@ -45,8 +45,6 @@ export interface SessionContext {
   toolTraceLastEditTimestamp?: number;
   /** Active tool traces keyed by the RPC execution/call id. */
   toolTraces?: Map<string, ToolExecutionTrace>;
-  /** Visual artifacts awaiting an interactive verdict. */
-  visualArtifacts?: Map<string, { artifact: VisualArtifact; messageId?: string }>;
 }
 export interface SessionManagerOptions {
   store?: SessionStore;
@@ -186,7 +184,6 @@ export class SessionManager {
       session.toolTraceHistory = [];
       session.toolTraceMessage = undefined;
       session.toolTraceMessagePromise = undefined;
-      session.visualArtifacts?.clear();
       try {
         session.process.kill();
       } catch (err) {
@@ -248,6 +245,13 @@ export class SessionManager {
       try {
         if (!existsSync(binding.cwd)) {
           console.warn(`⚠️ Working directory for thread ${binding.threadId} no longer exists (${binding.cwd}). Cleaning up.`);
+          const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
+          if (worktree) {
+            await removeGitWorktree(worktree).catch((err) => {
+              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+            });
+          }
+          cleanThreadAttachments(binding.cwd, binding.threadId);
           await this.store.delete(binding.threadId);
           continue;
         }
@@ -258,6 +262,13 @@ export class SessionManager {
 
         if (!channel || !channel.isThread()) {
           console.warn(`⚠️ Discord thread ${binding.threadId} is no longer accessible. Cleaning up.`);
+          const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
+          if (worktree) {
+            await removeGitWorktree(worktree).catch((err) => {
+              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+            });
+          }
+          cleanThreadAttachments(binding.cwd, binding.threadId);
           await this.store.delete(binding.threadId);
           continue;
         }

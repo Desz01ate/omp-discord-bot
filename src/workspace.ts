@@ -253,7 +253,7 @@ export async function createGitWorktree(cwd: string, threadId: string): Promise<
   if (!repo) return { ok: false, error: "This workspace is not a Git repository." };
 
   const branch = `discord/${threadId}`;
-  const worktreePath = join(repo.gitDir, "worktrees", threadId);
+  const worktreePath = join(repo.root, ".omp-worktrees", threadId);
   if (existsSync(worktreePath)) {
     return { ok: false, error: `A worktree already exists for thread ${threadId}.` };
   }
@@ -270,9 +270,9 @@ export async function createGitWorktree(cwd: string, threadId: string): Promise<
 }
 
 export async function removeGitWorktree(worktree: WorktreeInfo): Promise<boolean> {
-  const worktreeRoot = join(worktree.gitDir, "worktrees");
+  const worktreeRoot = join(worktree.repoRoot, ".omp-worktrees");
   if (!pathIsInside(worktree.path, worktreeRoot) || resolve(worktree.path) === resolve(worktreeRoot)) {
-    console.error(`Refusing to remove worktree outside Git administrative directory: ${worktree.path}`);
+    console.error(`Refusing to remove worktree outside OMP worktrees directory: ${worktree.path}`);
     return false;
   }
 
@@ -412,7 +412,7 @@ function collectWorkspaceFiles(rootDir: string, dir: string, output: WorkspaceFi
   }
   for (const entry of entries) {
     if (output.length >= limit) return;
-    if (entry.name === ".git" || entry.name === ".discord-attachments" || entry.name === "node_modules") continue;
+    if (entry.name === ".git" || entry.name === ".discord-attachments" || entry.name === ".omp-worktrees" || entry.name === "node_modules") continue;
     const fullPath = join(dir, entry.name);
     try {
       if (entry.isDirectory()) {

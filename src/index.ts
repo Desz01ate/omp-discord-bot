@@ -17,12 +17,8 @@ import {
   MessageFlags,
   Events,
   AttachmentBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
   type AutocompleteInteraction,
   type ButtonInteraction,
-  type ModalSubmitInteraction,
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
@@ -32,8 +28,7 @@ import {
   buildQuickActionRow,
   parseQuickActionId,
   parseReactionShortcut,
-  updateThreadStatusName,
-  type ThreadStatus,
+  isDefaultThreadName,
 } from "./ui-helpers";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
@@ -55,15 +50,10 @@ import {
 } from "./workspace";
 import {
   OBSERVABILITY_UPDATE_THROTTLE_MS,
-  createVisualVerdictEmbed,
-  createVisualVerdictRow,
-  extractVisualArtifact,
   formatHudEmbed,
   formatToolExecutionEmbed,
   formatToolOutputPreview,
   formatToolTracesEmbed,
-  createVisualVerdictResponse,
-  parseVisualVerdictCustomId,
   toolIcon,
   type HudState,
   type ToolExecutionTrace,
@@ -237,7 +227,6 @@ async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): 
   }
   const initialization = (async () => {
     session.toolTraces ||= new Map();
-    session.visualArtifacts ||= new Map();
     const initialState = (session.hudState || { cwd: session.cwd }) as HudState;
     try {
       const pinned = await thread.messages.fetchPinned().catch(() => null);
@@ -611,7 +600,6 @@ function createOmpSession(
     hudLastEditTimestamp: 0,
     toolTraces: new Map(),
     toolTraceHistory: [],
-    visualArtifacts: new Map(),
   };
   void ensurePinnedHud(session, thread);
 
@@ -640,7 +628,6 @@ function createOmpSession(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    void updateThreadStatus(thread, "error");
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
     if (session.toolTraceEditTimer) {
@@ -657,26 +644,19 @@ function createOmpSession(
   return session;
 }
 
-
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
   await sessionManager.terminate(session, client, deleteThread);
 }
 
-async function updateThreadStatus(thread: ThreadChannel, status: ThreadStatus): Promise<void> {
-  const nextName = updateThreadStatusName(thread.name, status);
-  if (nextName === thread.name) return;
-  await thread.setName(nextName).catch((err) => {
-    console.warn(`Failed to update status name for thread ${thread.id}:`, err);
-  });
-}
-
 async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
-  const nextName = buildDynamicThreadName(prompt, thread.name, "running");
+  if (!isDefaultThreadName(thread.name)) return;
+  const nextName = buildDynamicThreadName(prompt, thread.name, "idle");
   if (nextName === thread.name) return;
   await thread.setName(nextName).catch((err) => {
     console.warn(`Failed to derive a name for thread ${thread.id}:`, err);
   });
 }
+
 /**
  * Format tool execution details into a concise, user-friendly status line.
  */
@@ -996,7 +976,6 @@ async function handleToolExecutionUpdate(session: SessionContext, thread: Thread
   session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
   await ensureToolTraceMessage(session, thread);
-  await maybeSendVisualArtifact(session, thread, event, id);
 }
 
 async function handleToolExecutionEnd(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
@@ -1022,7 +1001,6 @@ async function handleToolExecutionEnd(session: SessionContext, thread: ThreadCha
   trace.error = typeof event.error === "string" ? event.error : trace.error;
   trace.phase = trace.error || (trace.exitCode != null && trace.exitCode !== 0) ? "failed" : "completed";
   await ensureToolTraceMessage(session, thread);
-  await maybeSendVisualArtifact(session, thread, event, id);
   session.toolTraces.delete(id);
   const nextRunningTrace = [...session.toolTraces.values()].reverse().find(
     (t) => t.phase === "running" || t.phase === "updated",
@@ -1038,46 +1016,7 @@ async function handleToolExecutionEnd(session: SessionContext, thread: ThreadCha
   );
 }
 
-async function maybeSendVisualArtifact(
-  session: SessionContext,
-  thread: ThreadChannel,
-  event: Record<string, unknown>,
-  traceId: string,
-): Promise<void> {
-  const artifactId = `visual_${traceId}`.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 60);
-  const artifact = extractVisualArtifact(event, artifactId);
-  if (!artifact) return;
-  session.visualArtifacts ||= new Map();
-  if ([...session.visualArtifacts.values()].some((entry) => entry.artifact.source === artifact.source)) return;
 
-  let attachment: AttachmentBuilder;
-  const attachmentName = basename(artifact.name || `${artifact.id}.png`).replace(/[^a-zA-Z0-9._-]/g, "_") || `${artifact.id}.png`;
-  try {
-    if (artifact.sourceType === "path") {
-      const artifactPath = resolve(session.cwd, artifact.source);
-      if (!existsSync(artifactPath)) return;
-      attachment = new AttachmentBuilder(artifactPath, { name: attachmentName });
-    } else if (artifact.sourceType === "data") {
-      const encoded = artifact.source.replace(/^data:image\/[\w.+-]+;base64,/i, "");
-      attachment = new AttachmentBuilder(Buffer.from(encoded, "base64"), { name: attachmentName });
-    } else {
-      const response = await fetch(artifact.source, { signal: AbortSignal.timeout(15000) });
-      if (!response.ok) return;
-      const bytes = Buffer.from(await response.arrayBuffer());
-      attachment = new AttachmentBuilder(bytes, { name: attachmentName });
-    }
-  } catch (error) {
-    console.warn(`Unable to load visual artifact ${artifact.source}:`, error);
-    return;
-  }
-  const embed = createVisualVerdictEmbed(artifact).setImage(`attachment://${attachmentName}`);
-  const message = await thread.send({
-    embeds: [embed],
-    files: [attachment],
-    components: [createVisualVerdictRow(artifact.id)],
-  }).catch(() => undefined);
-  session.visualArtifacts.set(artifact.id, { artifact, messageId: message?.id });
-}
 
 function updateSubagentHud(session: SessionContext, thread: ThreadChannel, delta: number): void {
   const current = (session.hudState || { cwd: session.cwd }) as HudState;
@@ -1122,7 +1061,7 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    void updateThreadStatus(thread, "error");
+
     const errorText = typeof event.message === "string" ? event.message : "OMP reported a fatal error.";
     await thread.send(`🔴 **OMP error:** ${errorText}`).catch(() => {});
     return;
@@ -1133,7 +1072,6 @@ async function handleRpcEvent(
     session.isRunning = true;
     session.completionBarAttached = false;
     session.confirmationPending = false;
-    void updateThreadStatus(thread, "running");
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
@@ -1210,7 +1148,6 @@ async function handleRpcEvent(
 
     if (method === "confirm" && id) {
       session.confirmationPending = true;
-      void updateThreadStatus(thread, "pending");
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`approve_${id}`)
@@ -1270,24 +1207,20 @@ async function handleRpcEvent(
           .catch(() => {});
       }
       session.confirmationPending = false;
-      void updateThreadStatus(thread, "running");
     }
     return;
   }
 
   if (type === "subagent_start") {
     updateSubagentHud(session, thread, 1);
-    await maybeSendVisualArtifact(session, thread, event, "subagent");
     return;
   }
 
   if (type === "subagent_end" || type === "subagent_result") {
     updateSubagentHud(session, thread, -1);
-    await maybeSendVisualArtifact(session, thread, event, "subagent");
     return;
   }
   if (type === "subagent_update") {
-    await maybeSendVisualArtifact(session, thread, event, "subagent");
     return;
   }
 
@@ -1370,7 +1303,6 @@ async function handleRpcEvent(
   if (type === "agent_end") {
     session.isRunning = false;
     session.confirmationPending = false;
-    void updateThreadStatus(thread, "idle");
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
@@ -1396,7 +1328,6 @@ async function handleRpcEvent(
     }
 
     session.completionBarAttached = true;
-    await maybeSendVisualArtifact(session, thread, event, "agent");
     const gitSnapshot = await getGitSnapshot(session.cwd);
     const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
     session.hudState = {
@@ -1416,7 +1347,6 @@ async function handleRpcEvent(
   if (type === "prompt_result") {
     session.isRunning = false;
     session.confirmationPending = false;
-    void updateThreadStatus(thread, "idle");
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
@@ -1668,54 +1598,6 @@ async function handleQuickAction(interaction: ButtonInteraction): Promise<void> 
 }
 
 // Handle Slash Command Executions
-async function handleVisualVerdictButton(interaction: ButtonInteraction): Promise<void> {
-  const parsed = parseVisualVerdictCustomId(interaction.customId);
-  if (!parsed) return;
-  const session = sessionManager.get(interaction.channelId);
-  const entry = session?.visualArtifacts?.get(parsed.artifactId);
-  if (!session || !entry) {
-    await interaction.reply({ content: "This visual artifact is no longer awaiting a verdict.", flags: MessageFlags.Ephemeral }).catch(() => {});
-    return;
-  }
-
-  if (parsed.verdict === "reject") {
-    const input = new TextInputBuilder()
-      .setCustomId("feedback")
-      .setLabel("What should change?")
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true)
-      .setMaxLength(1000);
-    const modal = new ModalBuilder()
-      .setCustomId(`visual_feedback:${parsed.artifactId}`)
-      .setTitle("Reject UI and leave feedback")
-      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-    await interaction.showModal(modal);
-    return;
-  }
-
-  sendRpc(session, createVisualVerdictResponse(parsed.artifactId, "approved"));
-  await interaction.update({ content: "✅ UI approved", components: [] }).catch(() => {});
-}
-
-async function handleVisualVerdictModal(interaction: ModalSubmitInteraction): Promise<void> {
-  const match = interaction.customId.match(/^visual_feedback:(.+)$/);
-  if (!match) return;
-  const artifactId = match[1];
-  const session = interaction.channelId ? sessionManager.get(interaction.channelId) : undefined;
-  const entry = session?.visualArtifacts?.get(artifactId);
-  if (!session || !entry) {
-    await interaction.reply({ content: "This visual artifact is no longer awaiting a verdict.", flags: MessageFlags.Ephemeral }).catch(() => {});
-    return;
-  }
-  const feedback = interaction.fields.getTextInputValue("feedback").trim();
-  sendRpc(session, createVisualVerdictResponse(artifactId, "rejected", feedback));
-  await interaction.reply({ content: "❌ UI rejected; your feedback was sent.", flags: MessageFlags.Ephemeral }).catch(() => {});
-  if (entry.messageId && interaction.channel?.isThread()) {
-    const message = await interaction.channel.messages.fetch(entry.messageId).catch(() => null);
-    await message?.edit({ content: "❌ UI rejected; feedback sent.", components: [] }).catch(() => {});
-  }
-}
-
 client.on("interactionCreate", async (interaction) => {
   if (!isUserAllowed(interaction.user.id)) {
     if (interaction.isAutocomplete()) {
@@ -1728,15 +1610,6 @@ client.on("interactionCreate", async (interaction) => {
         flags: MessageFlags.Ephemeral,
       });
     }
-    return;
-  }
-  if (interaction.isButton()) {
-    await handleVisualVerdictButton(interaction);
-    return;
-  }
-
-  if (interaction.isModalSubmit()) {
-    await handleVisualVerdictModal(interaction);
     return;
   }
 
@@ -1819,7 +1692,7 @@ client.on("interactionCreate", async (interaction) => {
           autoArchiveDuration: 1440,
         });
       }
-      await updateThreadStatus(thread, "idle");
+
       let sessionCwd = cwd;
       if (useWorktree) {
         const worktreeResult = await createGitWorktree(cwd, thread.id);

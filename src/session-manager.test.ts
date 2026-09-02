@@ -9,6 +9,7 @@ import {
   type OmpProcess,
 } from "./session-manager";
 import { SqliteSessionStore } from "./storage";
+import { createGitWorktree } from "./workspace";
 
 interface MockThread {
   id: string;
@@ -246,6 +247,54 @@ describe("SessionManager Composite Service", () => {
     const remainingStore = await store.list();
     expect(remainingStore.length).toBe(1);
     expect(remainingStore[0].threadId).toBe("live_thread");
+
+    await manager.close();
+  });
+
+  it("cleans up orphaned worktree when restored thread is inaccessible", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    await store.init();
+
+    const repoRoot = join(testDir, "worktree-repo");
+    mkdirSync(repoRoot, { recursive: true });
+    const gitProc = Bun.spawnSync(["git", "init", "-q"], { cwd: repoRoot });
+    expect(gitProc.exitCode).toBe(0);
+    writeFileSync(join(repoRoot, "init.txt"), "init\n");
+    Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "add", "init.txt"], { cwd: repoRoot });
+    Bun.spawnSync(["git", "commit", "-qm", "init"], { cwd: repoRoot });
+
+    const worktreeResult = await createGitWorktree(repoRoot, "orphaned_thread");
+    expect(worktreeResult.ok).toBe(true);
+    const worktree = worktreeResult.worktree!;
+    const worktreePath = worktree.path;
+
+    await store.set({
+      threadId: "orphaned_thread",
+      cwd: worktreePath,
+      createdAt: 1000,
+      updatedAt: 1000,
+      metadata: { worktree },
+    });
+
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const mockClient = {
+      channels: {
+        cache: new Map<string, unknown>(),
+        fetch: async () => null,
+      },
+    } as unknown as Client;
+
+    const restoredCount = await manager.restoreAll(mockClient, () => {
+      throw new Error("Should not spawn");
+    });
+
+    expect(restoredCount).toBe(0);
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(await store.get("orphaned_thread")).toBeNull();
 
     await manager.close();
   });
