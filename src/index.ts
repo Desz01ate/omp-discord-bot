@@ -45,6 +45,13 @@ function isUserAllowed(userId: string): boolean {
   return allowedUserIds.has(userId);
 }
 
+function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
+  const normalizedRoot = resolve(rootDir);
+  const normalizedTarget = resolve(targetPath);
+  const rel = relative(normalizedRoot, normalizedTarget);
+  return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
 type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 interface SessionContext {
@@ -917,6 +924,9 @@ function getDirectorySuggestions(input: string): Array<{ name: string; value: st
       searchDir = dirname(targetPath);
       filePrefix = basename(targetPath).toLowerCase();
     }
+    if (!isInsideWorkspace(searchDir, rootDir)) {
+      return suggestions.slice(0, 25);
+    }
 
     if (existsSync(searchDir) && statSync(searchDir).isDirectory()) {
       if (searchDir === targetPath && existsSync(targetPath)) {
@@ -1050,6 +1060,15 @@ client.on("interactionCreate", async (interaction) => {
       ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
       : rawCwd;
     const cwd = resolve(rootDir, expandedRawCwd);
+    const normalizedRoot = resolve(rootDir);
+
+    if (!isInsideWorkspace(cwd, normalizedRoot)) {
+      await interaction.reply({
+        content: `⛔ Access denied: Directory must be inside the workspace root (\`${normalizedRoot}\`).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
 
     if (!existsSync(cwd)) {
       await interaction.reply({
