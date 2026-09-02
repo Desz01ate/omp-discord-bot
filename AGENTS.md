@@ -33,7 +33,12 @@ omp-discord-bot/
 │   ├── run.sh            # Service launcher ensuring shell environment and .env loading
 │   └── deinit.sh         # Stops, disables, and removes the systemd user service
 ├── src/
-│   └── index.ts          # Core gateway: Discord client, RPC subprocess manager, event loop
+│   ├── index.ts          # Core gateway: Discord client, RPC subprocess manager, event loop
+│   └── storage/          # Pluggable persistence layer (SessionStore interface, SQLite, InMemory)
+│       ├── index.ts      # Storage factory & public exports
+│       ├── types.ts      # SessionBinding & SessionStore contracts
+│       ├── sqlite.ts     # Bun SQLite implementation (WAL mode, upserts)
+│       └── memory.ts     # Ephemeral in-memory implementation
 └── tsconfig.json         # TypeScript compiler configuration (Bun types, noEmit)
 
 ---
@@ -83,12 +88,13 @@ journalctl --user -u omp-discord-bot.service -f
 
 ## Core Architecture & Invariants
 
-### 1. Thread $\leftrightarrow$ Session 1:1 Mapping
+### 1. Thread $\leftrightarrow$ Session 1:1 Mapping & Persistence
 - Each active `omp` process is anchored to a specific Discord `ThreadChannel`.
-- The global `sessions` `Map<string, SessionContext>` indexes sessions strictly by `thread.id`.
-- Slash commands and chat messages outside an indexed thread channel must be rejected or redirected to create a session first (`/omp-new`).
-- When an `omp` subprocess exits (`proc.exited`), the session entry is deleted from the map and a notification is sent to the thread.
-- When a Discord thread is deleted (`Events.ThreadDelete`), the corresponding `omp` subprocess is killed automatically (`session.process.kill()`), triggering full memory and state cleanup.
+- The global `sessions` `Map<string, SessionContext>` indexes active in-memory processes strictly by `thread.id`.
+- Thread-to-session bindings (`threadId`, `cwd`, `initialModel`, timestamps, metadata) are persisted via a swappable `SessionStore` interface (backed by SQLite via `bun:sqlite` by default).
+- On bot startup / restart (`Events.ClientReady`), persisted session bindings are restored: if the Discord thread is active and accessible, the OMP RPC subprocess is automatically re-spawned and bound; if deleted while offline, the orphaned binding is cleaned up.
+- When an `omp` subprocess exits (`proc.exited`) or is terminated, the binding is removed from the store and in-memory map.
+- When a Discord thread is deleted (`Events.ThreadDelete`), the corresponding `omp` subprocess is killed automatically (`session.process.kill()`) and the persisted binding is removed.
 
 ### 2. OMP RPC Lifecycle & Protocol Negotiation
 - Subprocesses are spawned as `spawn(["omp", "--mode", "rpc"], { cwd, stdin: "pipe", stdout: "pipe", stderr: "inherit" })`.

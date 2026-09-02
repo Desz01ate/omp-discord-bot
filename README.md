@@ -6,8 +6,7 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 
 ## Features
 
-- **1:1 Thread $\leftrightarrow$ Session Mapping**: Launching `/omp-new` creates a dedicated Discord thread formatted as `<directory_name> ($session_id)`.
-- **Live Output Streaming**: Throttled streaming engine that renders LLM reasoning, code deltas, and tool updates smoothly while respecting Discord rate limits.
+- **1:1 Thread $\leftrightarrow$ Session Mapping & Persistence**: Launching `/omp-new` creates a dedicated Discord thread formatted as `<directory_name> ($session_id)`. Thread bindings survive bot restarts through a pluggable SQLite persistence layer (`SessionStore`).
 - **Full Slash Command & Skill Bindings**:
   - `/skill <name> <prompt>` — Rich autocomplete for all OMX workflows (`$ralph`, `$plan`, `$deep-interview`, `$code-review`, `$tdd`, etc.).
   - `/cmd <command> [args]` — Rich autocomplete for all 102+ native OMP commands and subcommands (`/security`, `/advisor`, `/prewalk`, `/dump`, etc.).
@@ -181,5 +180,10 @@ omp-discord-bot/
 │   ├── run.sh            # Service launcher script
 │   └── deinit.sh         # Systemd user service stopper and remover
 └── src/
-    └── index.ts          # Bot gateway, RPC manager, Discord event loop
+    ├── index.ts          # Bot gateway, RPC manager, Discord event loop
+    └── storage/          # Pluggable persistence layer (SessionStore, SQLite, InMemory)
+        ├── index.ts      # Storage factory and exports
+        ├── types.ts      # SessionStore and SessionBinding contracts
+        ├── sqlite.ts     # Bun SQLite implementation (WAL mode, upserts)
+        └── memory.ts     # In-memory storage implementation
 ```

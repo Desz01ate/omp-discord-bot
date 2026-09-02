@@ -18,6 +18,7 @@ import {
   Events,
   type AutocompleteInteraction,
 } from "discord.js";
+import { createSessionStore, type SessionStore, type SessionBinding } from "./storage";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
 import { Readable } from "stream";
@@ -96,6 +97,8 @@ let cachedCommands: OmpCommandMeta[] = [];
 let cachedModels: OmpModelMeta[] = [];
 
 const sessions = new Map<string, SessionContext>();
+const sessionStore: SessionStore = createSessionStore();
+await sessionStore.init();
 
 // Helper: send RPC command
 function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
@@ -429,6 +432,9 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     }
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     sessions.delete(thread.id);
+    void sessionStore.delete(thread.id).catch((err) => {
+      console.error(`Failed to remove session binding for thread ${thread.id} from store:`, err);
+    });
   });
 
   return session;
@@ -489,8 +495,10 @@ async function terminateSession(session: SessionContext, deleteThread = true): P
       console.error(`Error deleting thread ${session.threadId}:`, err);
     }
   }
-
   sessions.delete(session.threadId);
+  await sessionStore.delete(session.threadId).catch((err) => {
+    console.error(`Failed to remove session binding for thread ${session.threadId} from store:`, err);
+  });
 }
 
 /**
@@ -1182,6 +1190,18 @@ client.on("interactionCreate", async (interaction) => {
       }
       const session = createOmpSession(thread, cwd, inputModel || undefined);
       sessions.set(thread.id, session);
+      await sessionStore.set({
+        threadId: thread.id,
+        cwd,
+        initialModel: inputModel || undefined,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        metadata: {
+          guildId: thread.guildId,
+          parentChannelId: thread.parentId,
+          createdById: interaction.user.id,
+        },
+      });
 
       const [state, advisorConfig, branch] = await Promise.all([
         session.initialStatePromise,
@@ -1546,16 +1566,74 @@ client.on(Events.ThreadDelete, (thread) => {
   if (session) {
     console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
     void terminateSession(session, false);
+  } else {
+    void sessionStore.delete(thread.id).catch((err) => {
+      console.error(`Failed to delete session binding for deleted thread ${thread.id}:`, err);
+    });
   }
 });
 
-client.on(Events.ClientReady, () => {
+async function restorePersistedSessions(): Promise<void> {
+  try {
+    const bindings = await sessionStore.list();
+    if (bindings.length === 0) {
+      console.log("📦 No persisted sessions found to restore.");
+      return;
+    }
+
+    console.log(`📦 Found ${bindings.length} persisted session(s). Restoring bindings...`);
+    let restoredCount = 0;
+
+    for (const binding of bindings) {
+      try {
+        if (!existsSync(binding.cwd)) {
+          console.warn(`⚠️ Working directory for thread ${binding.threadId} no longer exists (\`${binding.cwd}\`). Cleaning up binding.`);
+          await sessionStore.delete(binding.threadId);
+          continue;
+        }
+
+        const channel =
+          client.channels.cache.get(binding.threadId) ??
+          (await client.channels.fetch(binding.threadId).catch(() => null));
+
+        if (!channel || !channel.isThread()) {
+          console.warn(`⚠️ Discord thread ${binding.threadId} is no longer accessible. Cleaning up binding.`);
+          await sessionStore.delete(binding.threadId);
+          continue;
+        }
+
+        if (channel.archived || channel.locked) {
+          console.log(`ℹ️ Discord thread ${binding.threadId} is archived/locked. Skipping RPC spawn.`);
+          continue;
+        }
+
+        if (sessions.has(binding.threadId)) {
+          continue;
+        }
+
+        const session = createOmpSession(channel, binding.cwd, binding.initialModel);
+        sessions.set(channel.id, session);
+        restoredCount++;
+        console.log(`✅ Restored active OMP session for thread ${channel.id} ("${channel.name}") in ${binding.cwd}`);
+      } catch (err) {
+        console.error(`Failed to restore session for thread ${binding.threadId}:`, err);
+      }
+    }
+
+    console.log(`🚀 Session restoration complete: ${restoredCount}/${bindings.length} active session(s) bound.`);
+  } catch (err) {
+    console.error("Error during session restoration:", err);
+  }
+}
+
+client.on(Events.ClientReady, async () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
   if (allowedUserIds.size > 0) {
     console.log(`🔒 User allowlist active: ${allowedUserIds.size} allowed user(s).`);
   } else {
     console.warn("⚠️ WARNING: No ALLOWED_USERS configured! All user interactions are blocked (fail-closed). Add Discord user IDs to ALLOWED_USERS in .env.");
   }
+  await restorePersistedSessions();
 });
 
 client.login(DISCORD_TOKEN);
