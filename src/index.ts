@@ -1281,6 +1281,9 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+const MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
+const ATTACHMENT_FETCH_TIMEOUT_MS = 15000; // 15 seconds
+
 // Attachment Helpers
 interface ImagePayload {
   type: "image";
@@ -1289,15 +1292,28 @@ interface ImagePayload {
 }
 
 async function processImageAttachment(
-  att: { url: string; contentType?: string | null; name?: string | null },
+  att: { url: string; contentType?: string | null; name?: string | null; size?: number },
 ): Promise<ImagePayload | null> {
+  if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
+    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    return null;
+  }
   try {
-    const res = await fetch(att.url);
+    const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       console.error(`Failed to download image attachment ${att.name || "unnamed"} (status ${res.status})`);
       return null;
     }
+    const contentLength = Number(res.headers.get("content-length"));
+    if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      return null;
+    }
     const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Image attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      return null;
+    }
     const base64 = Buffer.from(arrayBuf).toString("base64");
     let mimeType = att.contentType || "";
     if (!mimeType || !mimeType.startsWith("image/")) {
@@ -1335,15 +1351,28 @@ function getAttachmentDir(session: SessionContext, messageId: string): string {
 async function saveNonImageAttachment(
   session: SessionContext,
   messageId: string,
-  att: { url: string; name?: string | null },
+  att: { url: string; name?: string | null; size?: number },
 ): Promise<string | null> {
+  if (typeof att.size === "number" && att.size > MAX_ATTACHMENT_SIZE_BYTES) {
+    console.warn(`Attachment ${att.name || "unnamed"} exceeds max size limit (${att.size} > ${MAX_ATTACHMENT_SIZE_BYTES} bytes).`);
+    return null;
+  }
   try {
-    const res = await fetch(att.url);
+    const res = await fetch(att.url, { signal: AbortSignal.timeout(ATTACHMENT_FETCH_TIMEOUT_MS) });
     if (!res.ok) {
       console.error(`Failed to download attachment ${att.name || "unnamed"} (status ${res.status})`);
       return null;
     }
+    const contentLength = Number(res.headers.get("content-length"));
+    if (contentLength && contentLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${contentLength} bytes).`);
+      return null;
+    }
     const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength > MAX_ATTACHMENT_SIZE_BYTES) {
+      console.warn(`Attachment ${att.name || "unnamed"} exceeds size limit (${arrayBuf.byteLength} bytes).`);
+      return null;
+    }
     const dir = getAttachmentDir(session, messageId);
     const rawName = att.name || "attachment";
     const sanitized = basename(rawName).replace(/[^a-zA-Z0-9._-]/g, "_") || "attachment";
