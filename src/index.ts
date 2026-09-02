@@ -41,7 +41,7 @@ const allowedUserIds = new Set(
 );
 
 function isUserAllowed(userId: string): boolean {
-  if (allowedUserIds.size === 0) return true;
+  if (allowedUserIds.size === 0) return false;
   return allowedUserIds.has(userId);
 }
 
@@ -1419,9 +1419,9 @@ client.on(Events.ThreadDelete, (thread) => {
 client.on(Events.ClientReady, () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
   if (allowedUserIds.size > 0) {
-    console.log(`🔒 User whitelist active: ${allowedUserIds.size} allowed user(s).`);
+    console.log(`🔒 User allowlist active: ${allowedUserIds.size} allowed user(s).`);
   } else {
-    console.log("🔓 User whitelist inactive: all users permitted.");
+    console.warn("⚠️ WARNING: No ALLOWED_USERS configured! All user interactions are blocked (fail-closed). Add Discord user IDs to ALLOWED_USERS in .env.");
   }
 });
 
