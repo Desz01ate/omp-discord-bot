@@ -675,7 +675,7 @@ describe("handleMessageEditAsRewind Orchestration", () => {
   });
 });
 describe("Real OMP RPC Rewind Integration", () => {
-  it("branches and rewinds multi-turn conversation in real omp process", async () => {
+  it.skipIf(!Bun.which("omp"))("branches and rewinds multi-turn conversation in real omp process", async () => {
     const proc = Bun.spawn(["omp", "--mode", "rpc", "--no-session"], {
       stdin: "pipe",
       stdout: "pipe",
