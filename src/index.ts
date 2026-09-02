@@ -52,6 +52,14 @@ function isInsideWorkspace(targetPath: string, rootDir: string): boolean {
   return !rel.startsWith("..") && !isAbsolute(rel);
 }
 
+function getSanitizedChildEnv(): Record<string, string | undefined> {
+  const env = { ...process.env };
+  delete env.DISCORD_TOKEN;
+  delete env.DISCORD_CLIENT_ID;
+  delete env.ALLOWED_USERS;
+  delete env.WHITELISTED_USERS;
+  return env;
+}
 type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 interface SessionContext {
@@ -124,9 +132,10 @@ async function getGitBranch(cwd: string): Promise<string | null> {
  */
 async function getAdvisorConfig(cwd?: string): Promise<{ enabled: boolean; model: string | null }> {
   try {
+    const env = getSanitizedChildEnv();
     const [enabledProc, rolesProc] = [
-      spawn(["omp", "config", "get", "advisor.enabled"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
-      spawn(["omp", "config", "get", "modelRoles"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
+      spawn(["omp", "config", "get", "advisor.enabled"], cwd ? { cwd, env, stderr: "ignore" } : { env, stderr: "ignore" }),
+      spawn(["omp", "config", "get", "modelRoles"], cwd ? { cwd, env, stderr: "ignore" } : { env, stderr: "ignore" }),
     ];
 
     const [enabledOut, rolesOut] = await Promise.all([
@@ -153,6 +162,7 @@ async function getAdvisorConfig(cwd?: string): Promise<{ enabled: boolean; model
 async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models: OmpModelMeta[] }> {
   console.log("Discovering native OMP commands & models...");
   const proc = spawn(["omp", "--mode", "rpc"], {
+    env: getSanitizedChildEnv(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -163,7 +173,6 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
 
   let fetchedCommands: OmpCommandMeta[] = [];
   let fetchedModels: OmpModelMeta[] = [];
-
   const donePromise = new Promise<void>((resolve) => {
     let gotCommands = false;
     let gotModels = false;
@@ -374,6 +383,7 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
 
   const proc = spawn(args, {
     cwd,
+    env: getSanitizedChildEnv(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "inherit",
