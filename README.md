@@ -6,13 +6,14 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 
 ## Features
 
-- **1:1 Thread $\leftrightarrow$ Session Mapping & Persistence**: Launching `/omp-new` creates a dedicated Discord thread formatted as `<directory_name> ($session_id)`. Thread bindings survive bot restarts through a pluggable SQLite persistence layer (`SessionStore`).
+- **1:1 Thread $\leftrightarrow$ Session Mapping & Persistence**: Launching `/omp-new` creates a dedicated Discord thread with a generated `omp-session-*` name. The first prompt renames it to a status-prefixed topic (for example, `🟡 [ralph] Fix auth bug`) and later status transitions use `🟢` (idle), `🔴` (error), or `⏸️` (confirmation pending). Thread bindings survive bot restarts through a pluggable SQLite persistence layer (`SessionStore`).
 - **Full Slash Command & Skill Bindings**:
   - `/skill <name> <prompt>` — Rich autocomplete for all OMX workflows (`$ralph`, `$plan`, `$deep-interview`, `$code-review`, `$tdd`, etc.).
   - `/cmd <command> [args]` — Rich autocomplete for all 102+ native OMP commands and subcommands (`/security`, `/advisor`, `/prewalk`, `/dump`, etc.).
   - `/model [selection]` — Real-time model switcher with context window indicators.
   - `/omp-new`, `/omp-terminate-all`, `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
 - **Interactive UI Approvals**: Confirmation requests (`extension_ui_request`) render as Discord **Action Buttons** (`Approve` / `Deny`) with timeout handling.
+- **Quick Action Bars & Reaction Shortcuts**: Completed turns expose `Undo`, `Compact`, `Abort`, and `Status` buttons. In managed threads, `🔄` requests undo while `🛑` or `❌` requests abort; all actions honor `ALLOWED_USERS`.
 - **Systemd User Service & Docker**: One-command daemonization via `./scripts/init.sh` or isolated containerized deployment with `docker compose`.
 
 ---
@@ -137,7 +138,7 @@ journalctl --user -u omp-discord-bot.service -f
 
 | Command | Description |
 |---|---|
-| `/omp-new [directory]` | Spawns a new OMP session rooted in `directory` (default: cwd) and creates a dedicated Discord thread `🧵 <directory_name> ($session_id)`. |
+| `/omp-new [directory]` | Spawns an OMP session rooted in `directory` (default: cwd) and creates a dedicated Discord thread with a generated `omp-session-*` name; the first prompt derives a bounded topic name. |
 | `/omp-terminate-all` | Terminates all active on-server OMP sessions and deletes their associated Discord threads. |
 | `/abort` | Interrupts and cancels the currently running model turn in the active thread. |
 | `/status` | Displays an embed with active model, thinking level, fast mode state, token budget, and message count. |

@@ -17,16 +17,24 @@ import {
   MessageFlags,
   Events,
   type AutocompleteInteraction,
+  type ButtonInteraction,
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
 import { SessionManager, type SessionContext, type OmpProcess } from "./session-manager";
+import {
+  buildDynamicThreadName,
+  buildQuickActionRow,
+  parseQuickActionId,
+  parseReactionShortcut,
+  updateThreadStatusName,
+  type ThreadStatus,
+} from "./ui-helpers";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 
@@ -40,6 +48,9 @@ const allowedUserIds = new Set(
     .map((id) => id.trim())
     .filter((id) => id.length > 0),
 );
+
+const quickActionLastUsedAt = new Map<string, number>();
+const QUICK_ACTION_DEBOUNCE_MS = 750;
 
 function isUserAllowed(userId: string): boolean {
   if (allowedUserIds.size === 0) return false;
@@ -347,14 +358,14 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 console.log("Registering Discord Slash Commands...");
 await rest.put(Routes.applicationCommands(CLIENT_ID), { body: buildSlashCommands() });
 console.log("All Discord Slash Commands registered successfully.");
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel, Partials.Message],
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
 });
 
 // Spawn OMP RPC instance for a thread
@@ -406,11 +417,14 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     }
   });
   proc.exited.then((code: number | null) => {
+    session.isRunning = false;
+    session.confirmationPending = false;
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    void updateThreadStatus(thread, "error");
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     void sessionManager.remove(thread.id);
   });
@@ -443,6 +457,22 @@ function cleanThreadAttachments(session: SessionContext): void {
 
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
   await sessionManager.terminate(session, client, deleteThread);
+}
+
+async function updateThreadStatus(thread: ThreadChannel, status: ThreadStatus): Promise<void> {
+  const nextName = updateThreadStatusName(thread.name, status);
+  if (nextName === thread.name) return;
+  await thread.setName(nextName).catch((err) => {
+    console.warn(`Failed to update status name for thread ${thread.id}:`, err);
+  });
+}
+
+async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
+  const nextName = buildDynamicThreadName(prompt, thread.name, "running");
+  if (nextName === thread.name) return;
+  await thread.setName(nextName).catch((err) => {
+    console.warn(`Failed to derive a name for thread ${thread.id}:`, err);
+  });
 }
 /**
  * Format tool execution details into a concise, user-friendly status line.
@@ -658,8 +688,27 @@ async function handleRpcEvent(
     return;
   }
 
-  // 2. Turn Start
+  // 2. Fatal RPC errors
+  if (type === "error" || type === "fatal_error") {
+    session.isRunning = false;
+    session.confirmationPending = false;
+    stopTyping(session);
+    if (session.editTimer) {
+      clearTimeout(session.editTimer);
+      session.editTimer = undefined;
+    }
+    void updateThreadStatus(thread, "error");
+    const errorText = typeof event.message === "string" ? event.message : "OMP reported a fatal error.";
+    await thread.send(`🔴 **OMP error:** ${errorText}`).catch(() => {});
+    return;
+  }
+
+  // 3. Turn Start
   if (type === "agent_start") {
+    session.isRunning = true;
+    session.completionBarAttached = false;
+    session.confirmationPending = false;
+    void updateThreadStatus(thread, "running");
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
@@ -721,6 +770,8 @@ async function handleRpcEvent(
     const messageText = typeof event.message === "string" ? event.message : "Confirmation needed";
 
     if (method === "confirm" && id) {
+      session.confirmationPending = true;
+      void updateThreadStatus(thread, "pending");
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`approve_${id}`)
@@ -779,6 +830,8 @@ async function handleRpcEvent(
           })
           .catch(() => {});
       }
+      session.confirmationPending = false;
+      void updateThreadStatus(thread, "running");
     }
     return;
   }
@@ -853,42 +906,74 @@ async function handleRpcEvent(
 
   // 8. Turn Finish
   if (type === "agent_end") {
+    session.isRunning = false;
+    session.confirmationPending = false;
+    void updateThreadStatus(thread, "idle");
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
 
+    const components = [buildQuickActionRow(session.threadId)];
     if (session.activePromptMsg) {
       const full = session.currentStreamBuffer.trim();
       if (full) {
         const chunks = splitDiscordMessage(full, 1950);
-        await session.activePromptMsg.edit(chunks[0]).catch(() => {});
+        await session.activePromptMsg.edit({ content: chunks[0], components }).catch(() => {});
         for (let i = 1; i < chunks.length; i++) {
           await thread.send(chunks[i]).catch(() => {});
         }
       } else {
-        await session.activePromptMsg.edit("✅ *Completed.*").catch(() => {});
+        await session.activePromptMsg
+          .edit({ content: "✅ *Completed.*", components })
+          .catch(() => {});
       }
+    } else {
+      await thread.send({ content: "✅ *Completed.*", components }).catch(() => {});
     }
 
+    session.completionBarAttached = true;
     session.activePromptMsg = undefined;
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     return;
   }
 
-  // 9. Prompt Result without agent turn (Local command completion)
-  if (type === "prompt_result" && event.agentInvoked === false) {
+  // 9. Prompt Result, including local command completion without agent_end.
+  if (type === "prompt_result") {
+    session.isRunning = false;
+    session.confirmationPending = false;
+    void updateThreadStatus(thread, "idle");
     stopTyping(session);
     if (session.editTimer) {
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    if (session.activePromptMsg) {
-      await session.activePromptMsg.delete().catch(() => {});
-      session.activePromptMsg = undefined;
+
+    const shouldAttachActionBar = !session.completionBarAttached || event.agentInvoked === false;
+    if (shouldAttachActionBar) {
+      if (session.activePromptMsg) {
+        await session.activePromptMsg.delete().catch(() => {});
+        session.activePromptMsg = undefined;
+      }
+
+      const resultText = typeof event.result === "string"
+        ? event.result.trim()
+        : typeof event.message === "string"
+          ? event.message.trim()
+          : "";
+      const summary = resultText || "✅ *Completed.*";
+      const chunks = splitDiscordMessage(summary, 1950);
+      await thread
+        .send({ content: chunks[0], components: [buildQuickActionRow(session.threadId)] })
+        .catch(() => {});
+      for (let i = 1; i < chunks.length; i++) {
+        await thread.send(chunks[i]).catch(() => {});
+      }
+      session.completionBarAttached = true;
     }
+
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
   }
@@ -1040,6 +1125,57 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
   }
 }
 
+async function handleQuickAction(interaction: ButtonInteraction): Promise<void> {
+  const parsed = parseQuickActionId(interaction.customId);
+  if (!parsed || parsed.threadId !== interaction.channelId) {
+    await interaction.reply({ content: "⚠️ This action is not valid in this thread.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const session = sessionManager.get(parsed.threadId);
+  if (!session) {
+    await interaction.reply({ content: "⚠️ This OMP session is no longer active.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const debounceKey = `${interaction.user.id}:${interaction.customId}`;
+  const now = Date.now();
+  const lastUsedAt = quickActionLastUsedAt.get(debounceKey) || 0;
+  if (now - lastUsedAt < QUICK_ACTION_DEBOUNCE_MS) {
+    await interaction.reply({ content: "⏳ Please wait a moment before using that action again.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  quickActionLastUsedAt.set(debounceKey, now);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    switch (parsed.action) {
+      case "undo":
+        sendRpc(session, { id: `undo_${Date.now()}`, type: "prompt", message: "/undo" });
+        await interaction.editReply("↩️ Undo requested.");
+        break;
+      case "compact":
+        sendRpc(session, { id: `compact_${Date.now()}`, type: "compact" });
+        await interaction.editReply("🗜️ Context compaction triggered.");
+        break;
+      case "abort":
+        if (session.isRunning === false) {
+          await interaction.editReply("ℹ️ No active turn to abort.");
+          break;
+        }
+        sendRpc(session, { id: `abort_${Date.now()}`, type: "abort" });
+        await interaction.editReply("⏹️ Turn abort requested.");
+        break;
+      case "status":
+        sendRpc(session, { id: "status_req", type: "get_state" });
+        await interaction.editReply("📊 Status requested in this thread.");
+        break;
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await interaction.editReply(`❌ Action failed: ${message}`).catch(() => {});
+  }
+}
 
 // Handle Slash Command Executions
 client.on("interactionCreate", async (interaction) => {
@@ -1059,6 +1195,11 @@ client.on("interactionCreate", async (interaction) => {
 
   if (interaction.isAutocomplete()) {
     await handleAutocomplete(interaction);
+    return;
+  }
+
+  if (interaction.isButton()) {
+    await handleQuickAction(interaction);
     return;
   }
 
@@ -1101,10 +1242,8 @@ client.on("interactionCreate", async (interaction) => {
       });
       return;
     }
-    const dirName = basename(cwd) || "workspace";
     const sessionId = Math.random().toString(36).slice(2, 8);
-    const threadName = `${dirName} (${sessionId})`.slice(0, 100);
-
+    const threadName = `omp-session-${sessionId}`;
     await interaction.deferReply();
 
     try {
@@ -1131,6 +1270,7 @@ client.on("interactionCreate", async (interaction) => {
           autoArchiveDuration: 1440,
         });
       }
+      await updateThreadStatus(thread, "idle");
       const session = createOmpSession(thread, cwd, inputModel || undefined);
       await sessionManager.register(session, {
         initialModel: inputModel || undefined,
@@ -1487,12 +1627,45 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  session.lastPrompt = message.content.trim() || "Attachment";
+  if (message.channel.isThread()) {
+    await updateThreadNameFromPrompt(message.channel, session.lastPrompt);
+  }
+
+
   sendRpc(session, {
     id: `prompt_${Date.now()}`,
     type: "prompt",
     message: text,
     ...(images.length > 0 ? { images } : {}),
   });
+});
+
+// Handle Message Reaction Shortcuts
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot || !isUserAllowed(user.id)) return;
+
+  const resolvedReaction = reaction.partial ? await reaction.fetch().catch(() => null) : reaction;
+  if (!resolvedReaction) return;
+  const shortcut = parseReactionShortcut(resolvedReaction.emoji.name);
+  if (!shortcut) return;
+
+  const channel = resolvedReaction.message.channel;
+  if (!channel.isThread()) return;
+  const session = sessionManager.get(channel.id);
+  if (!session) return;
+
+  if (shortcut === "abort") {
+    if (session.isRunning === false) {
+      await channel.send("ℹ️ No active turn to abort.").catch(() => {});
+      return;
+    }
+    sendRpc(session, { id: `reaction_abort_${Date.now()}`, type: "abort" });
+    await channel.send(`⏹️ Turn abort requested by <@${user.id}>.`).catch(() => {});
+  } else {
+    sendRpc(session, { id: `reaction_undo_${Date.now()}`, type: "prompt", message: "/undo" });
+    await channel.send(`↩️ Undo requested by <@${user.id}>.`).catch(() => {});
+  }
 });
 
 // Handle Thread Deletions to clean up OMP processes automatically

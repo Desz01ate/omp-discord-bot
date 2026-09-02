@@ -20,6 +20,14 @@ export interface SessionContext {
   typingTimer?: Timer;
   initialStatePromise?: Promise<Record<string, unknown>>;
   resolveInitialState?: (state: Record<string, unknown>) => void;
+  /** True after agent_start and cleared when the turn completes. */
+  isRunning?: boolean;
+  /** Last user prompt, used for thread naming and UI context. */
+  lastPrompt?: string;
+  /** True while an extension confirmation is waiting for a Discord response. */
+  confirmationPending?: boolean;
+  /** Prevents a trailing prompt_result from duplicating the agent_end action bar. */
+  completionBarAttached?: boolean;
 }
 
 export interface SessionManagerOptions {
