@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import type { Subprocess } from "bun";
 import type { SessionStore, SessionBinding } from "./storage";
 import { createSessionStore } from "./storage";
+import type { ToolExecutionTrace, VisualArtifact } from "./observability";
 
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
@@ -20,8 +21,22 @@ export interface SessionContext {
   typingTimer?: Timer;
   initialStatePromise?: Promise<Record<string, unknown>>;
   resolveInitialState?: (state: Record<string, unknown>) => void;
-}
+  /** Pinned live dashboard message and its throttled update state. */
+  hudMessage?: Message;
+  hudUpdateTimer?: Timer;
+  hudInitPromise?: Promise<void>;
+  hudLastEditTimestamp?: number;
+  hudState?: Record<string, unknown>;
+  /** Active tool traces keyed by the RPC execution/call id. */
+  toolTraces?: Map<string, ToolExecutionTrace & {
+    message?: Message;
+    lastEditTimestamp: number;
+    editTimer?: Timer;
+  }>;
 
+  /** Visual artifacts awaiting an interactive verdict. */
+  visualArtifacts?: Map<string, { artifact: VisualArtifact; messageId?: string }>;
+}
 export interface SessionManagerOptions {
   store?: SessionStore;
 }
@@ -145,6 +160,13 @@ export class SessionManager {
         clearTimeout(session.editTimer);
         session.editTimer = undefined;
       }
+      if (session.hudUpdateTimer) {
+        clearTimeout(session.hudUpdateTimer);
+        session.hudUpdateTimer = undefined;
+      }
+      for (const trace of session.toolTraces?.values() || []) clearTimeout(trace.editTimer);
+      session.toolTraces?.clear();
+      session.visualArtifacts?.clear();
       try {
         session.process.kill();
       } catch (err) {

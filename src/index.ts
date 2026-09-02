@@ -16,7 +16,13 @@ import {
   EmbedBuilder,
   MessageFlags,
   Events,
+  AttachmentBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type AutocompleteInteraction,
+  type ButtonInteraction,
+  type ModalSubmitInteraction,
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
@@ -26,6 +32,25 @@ import type { ReadableStream as WebReadableStream } from "stream/web";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
+import {
+  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  createVisualVerdictEmbed,
+  createVisualVerdictRow,
+  extractVisualArtifact,
+  formatHudEmbed,
+  formatToolExecutionEmbed,
+  formatToolOutputPreview,
+  createVisualVerdictResponse,
+  parseVisualVerdictCustomId,
+  toolIcon,
+  type HudState,
+  type ToolExecutionTrace,
+} from "./observability";
+type ToolTraceState = ToolExecutionTrace & {
+  message?: Message;
+  lastEditTimestamp: number;
+  editTimer?: Timer;
+};
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -109,6 +134,138 @@ async function getGitBranch(cwd: string): Promise<string | null> {
     return commit ? `detached@${commit}` : null;
   } catch {
     return null;
+  }
+}
+
+async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dirty: boolean | null }> {
+  try {
+    const branch = await getGitBranch(cwd);
+    if (!branch) return { branch: null, dirty: null };
+    const statusProc = spawn(["git", "-c", "safe.directory=*", "status", "--porcelain"], {
+      cwd,
+      stderr: "ignore",
+    });
+    const status = (await new Response(statusProc.stdout).text()).trim();
+    return { branch, dirty: status.length > 0 };
+  } catch {
+    return { branch: null, dirty: null };
+  }
+}
+
+function readNumericValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
+  const usage = (data.contextUsage || data.tokenUsage || data.usage) as Record<string, unknown> | undefined;
+  const source = usage && typeof usage === "object" ? usage : data;
+  const input = readNumericValue(source.input ?? source.inputTokens ?? source.promptTokens);
+  const output = readNumericValue(source.output ?? source.outputTokens ?? source.completionTokens);
+  const total = readNumericValue(source.total ?? source.totalTokens ?? source.tokens ?? (input != null && output != null ? input + output : undefined));
+  const contextWindow = readNumericValue(source.contextWindow ?? data.contextWindow);
+  const contextPercent = readNumericValue(source.percent ?? source.contextPercent ?? data.contextPercent);
+  return { input, output, total, contextWindow, contextPercent };
+}
+
+function readModelDisplay(data: Record<string, unknown>): string | undefined {
+  if (typeof data.model === "string") return data.model;
+  if (!data.model || typeof data.model !== "object") return undefined;
+  const model = data.model as Record<string, unknown>;
+  const id = typeof model.id === "string" ? model.id : undefined;
+  const name = typeof model.name === "string" ? model.name : undefined;
+  const provider = typeof model.provider === "string" ? model.provider : undefined;
+  if (!id && !name) return undefined;
+  return `${provider ? `${provider}/` : ""}${id || name}${id && name ? ` (${name})` : ""}`;
+}
+
+function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
+  const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
+  if (typeof raw === "number") return raw;
+  if (!Array.isArray(raw)) return undefined;
+  return raw.map((agent) => {
+    if (typeof agent === "string") return agent;
+    if (agent && typeof agent === "object") {
+      const item = agent as Record<string, unknown>;
+      return String(item.name ?? item.id ?? item.role ?? "subagent");
+    }
+    return "subagent";
+  });
+}
+
+function mergeHudState(session: SessionContext, data: Record<string, unknown>, activeTool?: string): HudState {
+  const previous = (session.hudState || {}) as HudState;
+  const next: HudState = {
+    ...previous,
+    model: readModelDisplay(data) || previous.model,
+    reasoningLevel: typeof data.thinkingLevel === "string"
+      ? data.thinkingLevel
+      : typeof data.reasoningLevel === "string"
+        ? data.reasoningLevel
+        : previous.reasoningLevel,
+    tokens: readTokenUsage(data),
+    activeSubagents: readSubagentState(data) ?? previous.activeSubagents,
+    activeTool: activeTool === undefined ? previous.activeTool : activeTool,
+    turnStatus: previous.turnStatus,
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  };
+  session.hudState = next as unknown as Record<string, unknown>;
+  return next;
+}
+
+async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
+  if (session.hudMessage) return;
+  if (session.hudInitPromise) {
+    await session.hudInitPromise;
+    return;
+  }
+  const initialization = (async () => {
+    session.toolTraces ||= new Map();
+    session.visualArtifacts ||= new Map();
+    const initialState = (session.hudState || { cwd: session.cwd }) as HudState;
+    try {
+      const pinned = await thread.messages.fetchPinned().catch(() => null);
+      const existing = pinned?.find((message) => message.embeds.some((embed) => embed.title === "📡 OMP Live HUD"));
+      session.hudMessage = existing || await thread.send({ embeds: [formatHudEmbed(initialState)] });
+      if (!existing) await session.hudMessage.pin("OMP live observability HUD").catch(() => {});
+      session.hudLastEditTimestamp = Date.now();
+      scheduleHudUpdate(session, thread);
+    } catch (error) {
+      console.warn(`Unable to create pinned HUD for thread ${thread.id}:`, error);
+    }
+  })();
+  session.hudInitPromise = initialization;
+  try {
+    await initialization;
+  } finally {
+    if (session.hudInitPromise === initialization) session.hudInitPromise = undefined;
+  }
+}
+
+async function flushHudUpdate(session: SessionContext): Promise<void> {
+  clearTimeout(session.hudUpdateTimer);
+  session.hudUpdateTimer = undefined;
+  if (!session.hudMessage) return;
+  session.hudLastEditTimestamp = Date.now();
+  await session.hudMessage.edit({ embeds: [formatHudEmbed((session.hudState || { cwd: session.cwd }) as HudState)] }).catch(() => {});
+}
+
+function scheduleHudUpdate(session: SessionContext, thread?: ThreadChannel): void {
+  if (!session.hudMessage) {
+    if (thread) void ensurePinnedHud(session, thread);
+    return;
+  }
+  const elapsed = Date.now() - (session.hudLastEditTimestamp || 0);
+  if (elapsed >= OBSERVABILITY_UPDATE_THROTTLE_MS) {
+    void flushHudUpdate(session);
+    return;
+  }
+  if (!session.hudUpdateTimer) {
+    session.hudUpdateTimer = setTimeout(() => {
+      void flushHudUpdate(session);
+    }, OBSERVABILITY_UPDATE_THROTTLE_MS - elapsed);
   }
 }
 
@@ -386,7 +543,12 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
     lastEditTimestamp: 0,
     initialStatePromise,
     resolveInitialState,
+    hudState: { model: initialModel, cwd, turnStatus: "idle", updatedAt: Date.now() },
+    hudLastEditTimestamp: 0,
+    toolTraces: new Map(),
+    visualArtifacts: new Map(),
   };
+  void ensurePinnedHud(session, thread);
 
   const nodeStdout = Readable.fromWeb(proc.stdout as unknown as WebReadableStream);
   const readline = createInterface({
@@ -411,6 +573,10 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    clearTimeout(session.hudUpdateTimer);
+    session.hudUpdateTimer = undefined;
+    for (const trace of session.toolTraces?.values() || []) clearTimeout(trace.editTimer);
+    session.toolTraces?.clear();
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     void sessionManager.remove(thread.id);
   });
@@ -637,6 +803,183 @@ function scheduleActivePromptUpdate(session: SessionContext): void {
 }
 
 // Handle RPC Frames & Events
+function executionIdForEvent(event: Record<string, unknown>, toolName: string): string {
+  const candidate = event.executionId ?? event.toolExecutionId ?? event.toolCallId ?? event.callId ?? event.id;
+  return typeof candidate === "string" || typeof candidate === "number"
+    ? String(candidate)
+    : `${toolName}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function toolOutputFromEvent(event: Record<string, unknown>): unknown {
+  return event.output ?? event.result ?? event.text ?? event.content ?? event.error;
+}
+
+function toolExitCodeFromEvent(event: Record<string, unknown>): number | null | undefined {
+  const raw = event.exitCode ?? event.exit_status ?? event.code ?? (event.result && typeof event.result === "object"
+    ? (event.result as Record<string, unknown>).exitCode
+    : undefined);
+  if (raw === null) return null;
+  return readNumericValue(raw);
+}
+
+function updateHudActivity(session: SessionContext, thread: ThreadChannel, activeTool: string | undefined, turnStatus?: string): void {
+  const current = (session.hudState || { cwd: session.cwd }) as HudState;
+  session.hudState = {
+    ...current,
+    activeTool,
+    ...(turnStatus ? { turnStatus } : {}),
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  } as unknown as Record<string, unknown>;
+  scheduleHudUpdate(session, thread);
+}
+async function flushToolTrace(trace: ToolTraceState): Promise<void> {
+  clearTimeout(trace.editTimer);
+  trace.editTimer = undefined;
+  if (!trace.message) return;
+  await trace.message.edit({ embeds: [formatToolExecutionEmbed(trace)] }).catch(() => {});
+  trace.lastEditTimestamp = Date.now();
+}
+
+function scheduleToolTraceEdit(trace: ToolTraceState): void {
+  if (!trace.message) return;
+  const elapsed = Date.now() - trace.lastEditTimestamp;
+  if (elapsed >= OBSERVABILITY_UPDATE_THROTTLE_MS) {
+    void flushToolTrace(trace);
+  } else if (!trace.editTimer) {
+    trace.editTimer = setTimeout(() => {
+      void flushToolTrace(trace);
+    }, OBSERVABILITY_UPDATE_THROTTLE_MS - elapsed);
+  }
+}
+
+async function handleToolExecutionStart(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  const toolName = typeof event.toolName === "string"
+    ? event.toolName
+    : typeof event.tool === "string"
+      ? event.tool
+      : "tool";
+  const id = executionIdForEvent(event, toolName);
+  const trace: ToolTraceState = {
+    id,
+    toolName,
+    args: event.args ?? event.input,
+    intent: typeof event.intent === "string" ? event.intent : undefined,
+    phase: "running",
+    startedAt: Date.now(),
+    lastEditTimestamp: 0,
+  };
+  session.toolTraces.set(id, trace);
+  session.activeToolStatus = formatToolStatus(toolName, trace.args, trace.intent);
+  updateHudActivity(session, thread, `${toolIcon(toolName)} ${toolName}`, "running");
+  trace.message = await thread.send({ embeds: [formatToolExecutionEmbed(trace)] }).catch(() => undefined);
+  trace.lastEditTimestamp = Date.now();
+}
+
+async function handleToolExecutionUpdate(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+  const id = executionIdForEvent(event, toolName);
+  const existing = session.toolTraces.get(id);
+  const trace: ToolTraceState = existing || {
+    id,
+    toolName,
+    phase: "running",
+    startedAt: Date.now(),
+    lastEditTimestamp: 0,
+  };
+  if (!existing) session.toolTraces.set(id, trace);
+  trace.phase = "updated";
+  const output = formatToolOutputPreview(toolOutputFromEvent(event));
+  if (output) trace.outputPreview = output;
+  session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
+  updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
+  scheduleToolTraceEdit(trace);
+  await maybeSendVisualArtifact(session, thread, event, id);
+}
+
+async function handleToolExecutionEnd(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
+  session.toolTraces ||= new Map();
+  const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+  const id = executionIdForEvent(event, toolName);
+  const existing = session.toolTraces.get(id);
+  const trace = existing || {
+    id,
+    toolName,
+    phase: "running" as const,
+    startedAt: Date.now(),
+    lastEditTimestamp: 0,
+  };
+  if (!existing) session.toolTraces.set(id, trace);
+  trace.endedAt = Date.now();
+  trace.durationMs = trace.endedAt - trace.startedAt;
+  trace.exitCode = toolExitCodeFromEvent(event);
+  trace.outputPreview = formatToolOutputPreview(toolOutputFromEvent(event)) || trace.outputPreview;
+  trace.error = typeof event.error === "string" ? event.error : trace.error;
+  trace.phase = trace.error || (trace.exitCode != null && trace.exitCode !== 0) ? "failed" : "completed";
+  if (trace.message) await flushToolTrace(trace);
+  await maybeSendVisualArtifact(session, thread, event, id);
+  session.toolTraces.delete(id);
+  const nextTrace = session.toolTraces.values().next().value as ToolTraceState | undefined;
+  session.activeToolStatus = nextTrace ? formatToolStatus(nextTrace.toolName, nextTrace.args, nextTrace.intent) : undefined;
+  updateHudActivity(session, thread, nextTrace ? `${toolIcon(nextTrace.toolName)} ${nextTrace.toolName}` : undefined, "running");
+}
+
+async function maybeSendVisualArtifact(
+  session: SessionContext,
+  thread: ThreadChannel,
+  event: Record<string, unknown>,
+  traceId: string,
+): Promise<void> {
+  const artifactId = `visual_${traceId}`.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 60);
+  const artifact = extractVisualArtifact(event, artifactId);
+  if (!artifact) return;
+  session.visualArtifacts ||= new Map();
+  if ([...session.visualArtifacts.values()].some((entry) => entry.artifact.source === artifact.source)) return;
+
+  let attachment: AttachmentBuilder;
+  const attachmentName = basename(artifact.name || `${artifact.id}.png`).replace(/[^a-zA-Z0-9._-]/g, "_") || `${artifact.id}.png`;
+  try {
+    if (artifact.sourceType === "path") {
+      const artifactPath = resolve(session.cwd, artifact.source);
+      if (!existsSync(artifactPath)) return;
+      attachment = new AttachmentBuilder(artifactPath, { name: attachmentName });
+    } else if (artifact.sourceType === "data") {
+      const encoded = artifact.source.replace(/^data:image\/[\w.+-]+;base64,/i, "");
+      attachment = new AttachmentBuilder(Buffer.from(encoded, "base64"), { name: attachmentName });
+    } else {
+      const response = await fetch(artifact.source, { signal: AbortSignal.timeout(15000) });
+      if (!response.ok) return;
+      const bytes = Buffer.from(await response.arrayBuffer());
+      attachment = new AttachmentBuilder(bytes, { name: attachmentName });
+    }
+  } catch (error) {
+    console.warn(`Unable to load visual artifact ${artifact.source}:`, error);
+    return;
+  }
+  const embed = createVisualVerdictEmbed(artifact).setImage(`attachment://${attachmentName}`);
+  const message = await thread.send({
+    embeds: [embed],
+    files: [attachment],
+    components: [createVisualVerdictRow(artifact.id)],
+  }).catch(() => undefined);
+  session.visualArtifacts.set(artifact.id, { artifact, messageId: message?.id });
+}
+
+function updateSubagentHud(session: SessionContext, thread: ThreadChannel, delta: number): void {
+  const current = (session.hudState || { cwd: session.cwd }) as HudState;
+  const raw = current.activeSubagents;
+  const count = typeof raw === "number" ? raw : Array.isArray(raw) ? raw.length : 0;
+  session.hudState = {
+    ...current,
+    activeSubagents: Math.max(0, count + delta),
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  } as unknown as Record<string, unknown>;
+  scheduleHudUpdate(session, thread);
+}
+
 async function handleRpcEvent(
   session: SessionContext,
   thread: ThreadChannel,
@@ -668,6 +1011,7 @@ async function handleRpcEvent(
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
     session.lastEditTimestamp = Date.now();
+    updateHudActivity(session, thread, undefined, "running");
     startTyping(session, thread);
     return;
   }
@@ -691,25 +1035,30 @@ async function handleRpcEvent(
     }
     return;
   }
-
   // 4. Tool Execution Events
   if (type === "tool_execution_start") {
-    const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
-    const args = (event.args || event.input || {}) as Record<string, unknown>;
-    const intent = typeof event.intent === "string" ? event.intent : undefined;
+    await handleToolExecutionStart(session, thread, event);
+    return;
+  }
 
-    session.activeToolStatus = formatToolStatus(toolName, args, intent);
-    scheduleActivePromptUpdate(session);
+  if (type === "tool_execution_update") {
+    await handleToolExecutionUpdate(session, thread, event);
     return;
   }
 
   if (type === "tool_execution_end") {
-    session.activeToolStatus = undefined;
-    scheduleActivePromptUpdate(session);
+    await handleToolExecutionEnd(session, thread, event);
     return;
   }
 
-  if (type === "turn_start" || type === "turn_end") {
+  if (type === "turn_start") {
+    updateHudActivity(session, thread, undefined, "running");
+    session.activeToolStatus = undefined;
+    return;
+  }
+
+  if (type === "turn_end") {
+    updateHudActivity(session, thread, undefined, "idle");
     session.activeToolStatus = undefined;
     return;
   }
@@ -783,6 +1132,22 @@ async function handleRpcEvent(
     return;
   }
 
+  if (type === "subagent_start") {
+    updateSubagentHud(session, thread, 1);
+    await maybeSendVisualArtifact(session, thread, event, "subagent");
+    return;
+  }
+
+  if (type === "subagent_end" || type === "subagent_result") {
+    updateSubagentHud(session, thread, -1);
+    await maybeSendVisualArtifact(session, thread, event, "subagent");
+    return;
+  }
+  if (type === "subagent_update") {
+    await maybeSendVisualArtifact(session, thread, event, "subagent");
+    return;
+  }
+
   // 6. Built-in / Local Slash Command Outputs
   if (type === "command_output") {
     const rawOutput =
@@ -813,6 +1178,13 @@ async function handleRpcEvent(
       session.resolveInitialState = undefined;
     }
 
+    const gitSnapshot = await getGitSnapshot(session.cwd);
+    const hud = mergeHudState(session, data);
+    hud.branch = gitSnapshot.branch || undefined;
+    hud.gitDirty = gitSnapshot.dirty === null ? undefined : gitSnapshot.dirty;
+    session.hudState = hud as unknown as Record<string, unknown>;
+    scheduleHudUpdate(session, thread);
+
     if (event.id === "status_req") {
       const model = data.model as { provider?: string; id?: string; name?: string } | undefined;
       const modelStr = model ? `${model.provider ? `${model.provider}/` : ""}${model.id}${model.name ? ` (${model.name})` : ""}` : "unknown";
@@ -820,7 +1192,7 @@ async function handleRpcEvent(
 
       const [advisorConfig, branch] = await Promise.all([
         getAdvisorConfig(session.cwd),
-        getGitBranch(session.cwd),
+        Promise.resolve(gitSnapshot.branch),
       ]);
 
       const advisorText = advisorConfig.enabled
@@ -872,9 +1244,19 @@ async function handleRpcEvent(
       }
     }
 
+    await maybeSendVisualArtifact(session, thread, event, "agent");
+    const gitSnapshot = await getGitSnapshot(session.cwd);
+    const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
+    session.hudState = {
+      ...currentHud,
+      branch: gitSnapshot.branch || undefined,
+      gitDirty: gitSnapshot.dirty === null ? undefined : gitSnapshot.dirty,
+      updatedAt: Date.now(),
+    } as unknown as Record<string, unknown>;
     session.activePromptMsg = undefined;
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
+    updateHudActivity(session, thread, undefined, "idle");
     return;
   }
 
@@ -891,6 +1273,7 @@ async function handleRpcEvent(
     }
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
+    updateHudActivity(session, thread, undefined, "idle");
   }
 }
 
@@ -1042,6 +1425,54 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
 
 
 // Handle Slash Command Executions
+async function handleVisualVerdictButton(interaction: ButtonInteraction): Promise<void> {
+  const parsed = parseVisualVerdictCustomId(interaction.customId);
+  if (!parsed) return;
+  const session = sessionManager.get(interaction.channelId);
+  const entry = session?.visualArtifacts?.get(parsed.artifactId);
+  if (!session || !entry) {
+    await interaction.reply({ content: "This visual artifact is no longer awaiting a verdict.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+
+  if (parsed.verdict === "reject") {
+    const input = new TextInputBuilder()
+      .setCustomId("feedback")
+      .setLabel("What should change?")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(1000);
+    const modal = new ModalBuilder()
+      .setCustomId(`visual_feedback:${parsed.artifactId}`)
+      .setTitle("Reject UI and leave feedback")
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  sendRpc(session, createVisualVerdictResponse(parsed.artifactId, "approved"));
+  await interaction.update({ content: "✅ UI approved", components: [] }).catch(() => {});
+}
+
+async function handleVisualVerdictModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const match = interaction.customId.match(/^visual_feedback:(.+)$/);
+  if (!match) return;
+  const artifactId = match[1];
+  const session = interaction.channelId ? sessionManager.get(interaction.channelId) : undefined;
+  const entry = session?.visualArtifacts?.get(artifactId);
+  if (!session || !entry) {
+    await interaction.reply({ content: "This visual artifact is no longer awaiting a verdict.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  const feedback = interaction.fields.getTextInputValue("feedback").trim();
+  sendRpc(session, createVisualVerdictResponse(artifactId, "rejected", feedback));
+  await interaction.reply({ content: "❌ UI rejected; your feedback was sent.", flags: MessageFlags.Ephemeral }).catch(() => {});
+  if (entry.messageId && interaction.channel?.isThread()) {
+    const message = await interaction.channel.messages.fetch(entry.messageId).catch(() => null);
+    await message?.edit({ content: "❌ UI rejected; feedback sent.", components: [] }).catch(() => {});
+  }
+}
+
 client.on("interactionCreate", async (interaction) => {
   if (!isUserAllowed(interaction.user.id)) {
     if (interaction.isAutocomplete()) {
@@ -1054,6 +1485,15 @@ client.on("interactionCreate", async (interaction) => {
         flags: MessageFlags.Ephemeral,
       });
     }
+    return;
+  }
+  if (interaction.isButton()) {
+    await handleVisualVerdictButton(interaction);
+    return;
+  }
+
+  if (interaction.isModalSubmit()) {
+    await handleVisualVerdictModal(interaction);
     return;
   }
 
@@ -1140,6 +1580,7 @@ client.on("interactionCreate", async (interaction) => {
           createdById: interaction.user.id,
         },
       });
+      await ensurePinnedHud(session, thread);
       const [state, advisorConfig, branch] = await Promise.all([
         session.initialStatePromise,
         getAdvisorConfig(cwd),
