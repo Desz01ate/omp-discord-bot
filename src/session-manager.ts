@@ -12,6 +12,8 @@ export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 export interface UserPromptEntry {
   discordMessageId: string;
   text: string;
+  entryId?: string;
+  attachmentFingerprint?: string;
   savedFilePaths?: string[];
   imageCount: number;
   timestamp: number;

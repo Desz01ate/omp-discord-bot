@@ -862,6 +862,35 @@ function scheduleActivePromptUpdate(session: SessionContext): void {
   }
 }
 
+/**
+ * Sync OMP session entry IDs to tracked user prompts for reliable checkpointing.
+ */
+async function syncSessionPromptEntryIds(session: SessionContext): Promise<void> {
+  if (!session.userPrompts || session.userPrompts.length === 0) return;
+  try {
+    const branchRes = await sendRpcRequest(session, { type: "get_branch_messages" }, 3000);
+    if (
+      branchRes.data &&
+      typeof branchRes.data === "object" &&
+      "messages" in branchRes.data &&
+      Array.isArray(branchRes.data.messages)
+    ) {
+      const branchMessages = branchRes.data.messages.filter(
+        (m): m is { entryId: string; text: string } =>
+          m && typeof m === "object" && typeof m.entryId === "string" && typeof m.text === "string",
+      );
+      for (const p of session.userPrompts) {
+        if (!p.entryId) {
+          const match = branchMessages.find((m) => m.text === p.text);
+          if (match) {
+            p.entryId = match.entryId;
+          }
+        }
+      }
+    }
+  } catch {}
+}
+
 // Handle RPC Frames & Events
 function executionIdForEvent(event: Record<string, unknown>, toolName: string): string {
   const candidate = event.executionId ?? event.toolExecutionId ?? event.toolCallId ?? event.callId ?? event.id;
@@ -1323,6 +1352,7 @@ async function handleRpcEvent(
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     updateHudActivity(session, thread, undefined, "idle");
+    void syncSessionPromptEntryIds(session);
     return;
   }
 
@@ -2104,12 +2134,22 @@ async function saveNonImageAttachment(
 }
 
 
+function computeAttachmentFingerprint(message: Message): string {
+  if (!message.attachments || message.attachments.size === 0) return "";
+  const parts: string[] = [];
+  for (const [, att] of message.attachments) {
+    parts.push(`${att.id}:${att.name || ""}:${att.size || 0}:${att.url}`);
+  }
+  return parts.sort().join("|");
+}
+
 async function prepareMessagePayload(
   session: SessionContext,
   message: Message,
-): Promise<{ text: string; images: ImagePayload[]; savedFilePaths: string[] }> {
+): Promise<{ text: string; images: ImagePayload[]; savedFilePaths: string[]; attachmentFingerprint: string }> {
   const images: ImagePayload[] = [];
   const savedFilePaths: string[] = [];
+  const attachmentFingerprint = computeAttachmentFingerprint(message);
 
   if (message.attachments && message.attachments.size > 0) {
     for (const [, att] of message.attachments) {
@@ -2132,7 +2172,7 @@ async function prepareMessagePayload(
     text = text ? `${fileRefs} ${text}` : fileRefs;
   }
 
-  return { text, images, savedFilePaths };
+  return { text, images, savedFilePaths, attachmentFingerprint };
 }
 
 // Handle Chat Messages in Threads
@@ -2148,7 +2188,7 @@ client.on("messageCreate", async (message) => {
         startTyping(session, message.channel);
       }
 
-      const { text, images, savedFilePaths } = await prepareMessagePayload(session, message);
+      const { text, images, savedFilePaths, attachmentFingerprint } = await prepareMessagePayload(session, message);
 
       if (!text && images.length === 0) {
         stopTyping(session);
@@ -2162,6 +2202,7 @@ client.on("messageCreate", async (message) => {
         discordMessageId: message.id,
         text,
         savedFilePaths,
+        attachmentFingerprint,
         imageCount: images.length,
         timestamp: Date.now(),
       });
@@ -2211,10 +2252,13 @@ client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
       if (promptIndex === -1) return;
 
       const previousPrompt = session.userPrompts[promptIndex];
-      const { text, images, savedFilePaths } = await prepareMessagePayload(session, newMessage);
+      const { text, images, savedFilePaths, attachmentFingerprint } = await prepareMessagePayload(session, newMessage);
 
-      // If text and images have not changed, skip (e.g. pin or embed update)
-      if (text === previousPrompt.text && images.length === previousPrompt.imageCount) {
+      // If text and attachments have not changed, skip (e.g. pin or embed update)
+      if (
+        text === previousPrompt.text &&
+        attachmentFingerprint === (previousPrompt.attachmentFingerprint || "")
+      ) {
         return;
       }
 
@@ -2247,6 +2291,7 @@ client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
       }
 
       // 2. Query branch messages to find target checkpoint entryId
+      let branchSucceeded = false;
       try {
         const branchRes = await sendRpcRequest(session, { type: "get_branch_messages" });
         let branchMessages: Array<{ entryId: string; text: string }> = [];
@@ -2262,13 +2307,25 @@ client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
           );
         }
 
-        let targetEntry: { entryId: string; text: string } | undefined = branchMessages[promptIndex];
+        let targetEntry: { entryId: string; text: string } | undefined;
+        if (previousPrompt.entryId) {
+          targetEntry = branchMessages.find((m) => m.entryId === previousPrompt.entryId);
+        }
+        if (!targetEntry && promptIndex < branchMessages.length && branchMessages[promptIndex]?.text === previousPrompt.text) {
+          targetEntry = branchMessages[promptIndex];
+        }
         if (!targetEntry) {
           targetEntry = branchMessages.find((m) => m.text === previousPrompt.text);
         }
+
         if (targetEntry) {
           console.log(`Rewinding OMP session to entryId: ${targetEntry.entryId} ("${targetEntry.text}")`);
-          await sendRpcRequest(session, { type: "branch", entryId: targetEntry.entryId });
+          const branchResult = await sendRpcRequest(session, { type: "branch", entryId: targetEntry.entryId });
+          if (branchResult && branchResult.success === true) {
+            branchSucceeded = true;
+          } else {
+            console.error("OMP branch request failed:", branchResult);
+          }
         } else {
           console.warn(
             `Branch entry for prompt at index ${promptIndex} not found in OMP branch messages (count: ${branchMessages.length}).`,
@@ -2276,6 +2333,13 @@ client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
         }
       } catch (err) {
         console.error("Failed to rewind OMP session branch:", err);
+      }
+
+      // If rewind failed or checkpoint was not found, do not corrupt state or resubmit
+      if (!branchSucceeded) {
+        console.warn(`Skipping resubmission: OMP session could not be rewound to checkpoint for message ${newMessage.id}.`);
+        stopTyping(session);
+        return;
       }
 
       // 3. Truncate userPrompts history to remove rewound turns
@@ -2291,6 +2355,7 @@ client.on(Events.MessageUpdate, async (_oldMessage, rawNewMessage) => {
         discordMessageId: newMessage.id,
         text,
         savedFilePaths,
+        attachmentFingerprint,
         imageCount: images.length,
         timestamp: Date.now(),
       });

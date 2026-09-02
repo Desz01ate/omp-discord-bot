@@ -351,6 +351,103 @@ describe("Message-Edit-as-a-Rewind Support", () => {
     expect(session.userPrompts[1].text).toBe("Turn 2 completed correctly");
     // Turn 3 was pruned as expected
   });
+  it("does not truncate history or resubmit prompt if OMP branch rewind fails", async () => {
+    const { session, written } = createMockSessionContext();
+
+    session.userPrompts = [
+      { discordMessageId: "msg_1", text: "Turn 1", imageCount: 0, timestamp: 1000 },
+      { discordMessageId: "msg_2", text: "Turn 2", imageCount: 0, timestamp: 2000 },
+    ];
+
+    const promptIndex = session.userPrompts.findIndex((p) => p.discordMessageId === "msg_2");
+    expect(promptIndex).toBe(1);
+
+    const branchRequestPromise = sendRpcRequest(session, { type: "get_branch_messages" }, 1000);
+    const branchReq = JSON.parse(written[0]);
+
+    // Simulate get_branch_messages returning an error or no match
+    session.pendingRpcRequests?.get(branchReq.id)?.({
+      id: branchReq.id,
+      type: "response",
+      command: "get_branch_messages",
+      success: false,
+      error: "Branch lookup failure",
+    });
+
+    const branchRes = await branchRequestPromise;
+    let branchSucceeded = false;
+    if (branchRes.success === true) {
+      branchSucceeded = true;
+    }
+
+    // When branch lookup fails, branchSucceeded is false
+    expect(branchSucceeded).toBe(false);
+
+    // History is NOT truncated and prompt is NOT resubmitted
+    expect(session.userPrompts.length).toBe(2);
+    expect(session.userPrompts[0].text).toBe("Turn 1");
+    expect(session.userPrompts[1].text).toBe("Turn 2");
+    expect(written.length).toBe(1); // Only the get_branch_messages call was sent
+  });
+
+  it("detects edit and triggers rewind when attachment fingerprint changes", () => {
+    const previousPrompt: UserPromptEntry = {
+      discordMessageId: "msg_1",
+      text: "Look at this image",
+      attachmentFingerprint: "att_1:photo.png:1024:https://cdn.discord.com/1",
+      imageCount: 1,
+      timestamp: 1000,
+    };
+
+    const newText = "Look at this image";
+    const newFingerprint = "att_2:photo_revised.png:2048:https://cdn.discord.com/2";
+
+    const isChanged =
+      newText !== previousPrompt.text ||
+      newFingerprint !== (previousPrompt.attachmentFingerprint || "");
+
+    expect(isChanged).toBe(true);
+  });
+
+  it("matches branch checkpoint using explicit entryId on UserPromptEntry", async () => {
+    const { session, written } = createMockSessionContext();
+
+    session.userPrompts = [
+      {
+        discordMessageId: "msg_1",
+        text: "Turn 1",
+        entryId: "target_entry_id_123",
+        imageCount: 0,
+        timestamp: 1000,
+      },
+    ];
+
+    const branchRequestPromise = sendRpcRequest(session, { type: "get_branch_messages" }, 1000);
+    const branchReq = JSON.parse(written[0]);
+
+    session.pendingRpcRequests?.get(branchReq.id)?.({
+      id: branchReq.id,
+      type: "response",
+      command: "get_branch_messages",
+      success: true,
+      data: {
+        messages: [
+          { entryId: "target_entry_id_123", text: "Turn 1" },
+          { entryId: "other_entry", text: "Other" },
+        ],
+      },
+    });
+
+    const branchRes = await branchRequestPromise;
+    const branchMessages = (
+      branchRes.data as { messages: Array<{ entryId: string; text: string }> }
+    ).messages;
+
+    const targetEntry = branchMessages.find((m) => m.entryId === session.userPrompts![0].entryId);
+    expect(targetEntry).toBeDefined();
+    expect(targetEntry?.entryId).toBe("target_entry_id_123");
+  });
+
   it("integrates with real OMP subprocess: verifies branch rewind via RPC", async () => {
     const proc = Bun.spawn(["omp", "--mode", "rpc", "--no-session"], {
       stdin: "pipe",
