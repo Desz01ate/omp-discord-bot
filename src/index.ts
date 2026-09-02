@@ -22,8 +22,8 @@ import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
-import { basename, resolve } from "path";
-import { existsSync } from "fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
+import { existsSync, readdirSync, statSync } from "fs";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -161,7 +161,6 @@ const OMX_SKILLS = [
 // Build Discord Slash Commands
 function buildSlashCommands() {
   return [
-    // 1. Session creation
     new SlashCommandBuilder()
       .setName("omp-new")
       .setDescription("Start a new OMP session in a dedicated thread")
@@ -169,6 +168,14 @@ function buildSlashCommands() {
         opt
           .setName("directory")
           .setDescription("Working directory path (default: WORKSPACE_ROOT or current directory)")
+          .setAutocomplete(true)
+          .setRequired(false),
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("model")
+          .setDescription("Initial model to use for the session")
+          .setAutocomplete(true)
           .setRequired(false),
       ),
 
@@ -734,9 +741,112 @@ async function handleRpcEvent(
   }
 }
 
+function getModelSuggestions(queryRaw: string): Array<{ name: string; value: string }> {
+  const query = queryRaw.toLowerCase();
+  return cachedModels
+    .filter((m) => m.id.toLowerCase().includes(query) || (m.name && m.name.toLowerCase().includes(query)))
+    .slice(0, 25)
+    .map((m) => ({
+      name: `${m.name || m.id} [${m.provider || "omp"}] (${Math.round((m.contextWindow || 0) / 1000)}k ctx)`.slice(0, 100),
+      value: m.id,
+    }));
+}
+
+function getDirectorySuggestions(input: string): Array<{ name: string; value: string }> {
+  const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
+  const suggestions: Array<{ name: string; value: string }> = [];
+
+  try {
+    const rawInput = input.trim();
+    const expanded = rawInput.startsWith("~")
+      ? rawInput.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
+      : rawInput;
+
+    if (!rawInput) {
+      suggestions.push({
+        name: `📁 . (Root: ${basename(rootDir) || rootDir})`,
+        value: ".",
+      });
+      if (existsSync(rootDir)) {
+        const entries = readdirSync(rootDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
+            suggestions.push({
+              name: `📁 ${entry.name}/`,
+              value: entry.name,
+            });
+          }
+        }
+      }
+      return suggestions.slice(0, 25);
+    }
+
+    const isAbs = isAbsolute(expanded) || rawInput.startsWith("~");
+    const targetPath = isAbs ? resolve(expanded) : resolve(rootDir, expanded);
+
+    let searchDir = targetPath;
+    let filePrefix = "";
+
+    const endsWithSlash = rawInput.endsWith("/") || rawInput.endsWith("\\");
+    if (!endsWithSlash && existsSync(targetPath) && statSync(targetPath).isDirectory()) {
+      searchDir = targetPath;
+      filePrefix = "";
+    } else if (!endsWithSlash) {
+      searchDir = dirname(targetPath);
+      filePrefix = basename(targetPath).toLowerCase();
+    }
+
+    if (existsSync(searchDir) && statSync(searchDir).isDirectory()) {
+      if (searchDir === targetPath && existsSync(targetPath)) {
+        suggestions.push({
+          name: `📁 ${rawInput} (current)`,
+          value: rawInput,
+        });
+      }
+
+      const entries = readdirSync(searchDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !filePrefix.startsWith(".") && filePrefix !== "node_modules") continue;
+        if (filePrefix && !entry.name.toLowerCase().startsWith(filePrefix)) continue;
+
+        let val: string;
+        if (isAbs) {
+          val = join(searchDir, entry.name);
+        } else {
+          const relToRoot = relative(rootDir, join(searchDir, entry.name));
+          val = relToRoot.startsWith(".") ? relToRoot : `./${relToRoot}`;
+        }
+        suggestions.push({
+          name: `📁 ${entry.name}/ (${val})`.slice(0, 100),
+          value: val.slice(0, 100),
+        });
+      }
+    }
+  } catch {
+    // Return collected suggestions safely on filesystem or permission error
+  }
+
+  return suggestions.slice(0, 25);
+}
+
 // Handle Autocomplete Interactions
 async function handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
   const focused = interaction.options.getFocused(true);
+
+  // New session autocomplete (directory & model)
+  if (interaction.commandName === "omp-new") {
+    if (focused.name === "directory") {
+      const suggestions = getDirectorySuggestions(focused.value);
+      await interaction.respond(suggestions);
+      return;
+    }
+    if (focused.name === "model" || focused.name === "selection") {
+      const filtered = getModelSuggestions(focused.value);
+      await interaction.respond(filtered);
+      return;
+    }
+  }
 
   // Skill autocomplete
   if (interaction.commandName === "skill" && focused.name === "name") {
@@ -768,18 +878,12 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
 
   // Model autocomplete
   if (interaction.commandName === "model" && focused.name === "selection") {
-    const query = focused.value.toLowerCase();
-    const filtered = cachedModels
-      .filter((m) => m.id.toLowerCase().includes(query) || (m.name && m.name.toLowerCase().includes(query)))
-      .slice(0, 25)
-      .map((m) => ({
-        name: `${m.name || m.id} [${m.provider || "omp"}] (${Math.round((m.contextWindow || 0) / 1000)}k ctx)`.slice(0, 100),
-        value: m.id,
-      }));
+    const filtered = getModelSuggestions(focused.value);
     await interaction.respond(filtered);
     return;
   }
 }
+
 
 // Handle Slash Command Executions
 client.on("interactionCreate", async (interaction) => {
@@ -818,6 +922,7 @@ client.on("interactionCreate", async (interaction) => {
     const textChannel = channel as TextChannel;
     const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
     const inputDir = interaction.options.getString("directory");
+    const inputModel = interaction.options.getString("model");
     const rawCwd = inputDir || rootDir;
     const expandedRawCwd = rawCwd.startsWith("~")
       ? rawCwd.replace(/^~(?=$|\/|\\)/, process.env.HOME || "")
@@ -846,7 +951,17 @@ client.on("interactionCreate", async (interaction) => {
       const session = createOmpSession(thread, cwd);
       sessions.set(thread.id, session);
 
-      await interaction.editReply(`🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\``);
+      if (inputModel) {
+        sendRpc(session, {
+          id: `model_init_${Date.now()}`,
+          type: "prompt",
+          message: `/model ${inputModel}`,
+        });
+      }
+
+      await interaction.editReply(
+        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\`${inputModel ? `\n🤖 Model: \`${inputModel}\`` : ""}`,
+      );
       await thread.send(
         `👋 **OMP Session Active**\nType in this thread or use slash commands (\`/skill\`, \`/cmd\`, \`/model\`, \`/fast\`, \`/think\`, \`/abort\`, \`/status\`).`,
       );
