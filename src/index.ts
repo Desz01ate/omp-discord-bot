@@ -61,17 +61,13 @@ import {
   formatHudEmbed,
   formatToolExecutionEmbed,
   formatToolOutputPreview,
+  formatToolTracesEmbed,
   createVisualVerdictResponse,
   parseVisualVerdictCustomId,
   toolIcon,
   type HudState,
   type ToolExecutionTrace,
 } from "./observability";
-type ToolTraceState = ToolExecutionTrace & {
-  message?: Message;
-  lastEditTimestamp: number;
-  editTimer?: Timer;
-};
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -614,6 +610,7 @@ function createOmpSession(
     hudState: { model: initialModel, cwd, turnStatus: "idle", updatedAt: Date.now() },
     hudLastEditTimestamp: 0,
     toolTraces: new Map(),
+    toolTraceHistory: [],
     visualArtifacts: new Map(),
   };
   void ensurePinnedHud(session, thread);
@@ -646,8 +643,14 @@ function createOmpSession(
     void updateThreadStatus(thread, "error");
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
-    for (const trace of session.toolTraces?.values() || []) clearTimeout(trace.editTimer);
+    if (session.toolTraceEditTimer) {
+      clearTimeout(session.toolTraceEditTimer);
+      session.toolTraceEditTimer = undefined;
+    }
     session.toolTraces?.clear();
+    session.toolTraceHistory = [];
+    session.toolTraceMessage = undefined;
+    session.toolTraceMessagePromise = undefined;
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     void sessionManager.terminate(session, undefined, false);
   });
@@ -897,97 +900,142 @@ function updateHudActivity(session: SessionContext, thread: ThreadChannel, activ
   } as unknown as Record<string, unknown>;
   scheduleHudUpdate(session, thread);
 }
-async function flushToolTrace(trace: ToolTraceState): Promise<void> {
-  clearTimeout(trace.editTimer);
-  trace.editTimer = undefined;
-  if (!trace.message) return;
-  await trace.message.edit({ embeds: [formatToolExecutionEmbed(trace)] }).catch(() => {});
-  trace.lastEditTimestamp = Date.now();
+async function flushToolTraceMessage(session: SessionContext): Promise<void> {
+  if (session.toolTraceEditTimer) {
+    clearTimeout(session.toolTraceEditTimer);
+    session.toolTraceEditTimer = undefined;
+  }
+  if (!session.toolTraceMessage || !session.toolTraceHistory || session.toolTraceHistory.length === 0) return;
+  const embed = formatToolTracesEmbed(session.toolTraceHistory);
+  await session.toolTraceMessage.edit({ embeds: [embed] }).catch(() => {});
+  session.toolTraceLastEditTimestamp = Date.now();
 }
 
-function scheduleToolTraceEdit(trace: ToolTraceState): void {
-  if (!trace.message) return;
-  const elapsed = Date.now() - trace.lastEditTimestamp;
+function scheduleToolTraceMessageEdit(session: SessionContext): void {
+  if (!session.toolTraceMessage) return;
+  const elapsed = Date.now() - (session.toolTraceLastEditTimestamp || 0);
   if (elapsed >= OBSERVABILITY_UPDATE_THROTTLE_MS) {
-    void flushToolTrace(trace);
-  } else if (!trace.editTimer) {
-    trace.editTimer = setTimeout(() => {
-      void flushToolTrace(trace);
+    void flushToolTraceMessage(session);
+  } else if (!session.toolTraceEditTimer) {
+    session.toolTraceEditTimer = setTimeout(() => {
+      void flushToolTraceMessage(session);
     }, OBSERVABILITY_UPDATE_THROTTLE_MS - elapsed);
   }
 }
 
+async function ensureToolTraceMessage(session: SessionContext, thread: ThreadChannel): Promise<void> {
+  session.toolTraceHistory ||= [];
+  session.toolTraces ||= new Map();
+
+  if (session.toolTraceMessage) {
+    scheduleToolTraceMessageEdit(session);
+    return;
+  }
+
+  if (session.toolTraceMessagePromise) {
+    await session.toolTraceMessagePromise;
+    scheduleToolTraceMessageEdit(session);
+    return;
+  }
+
+  session.toolTraceMessagePromise = (async () => {
+    const embed = formatToolTracesEmbed(session.toolTraceHistory || []);
+    const msg = await thread.send({ embeds: [embed] }).catch(() => undefined);
+    session.toolTraceMessage = msg;
+    session.toolTraceLastEditTimestamp = Date.now();
+    session.toolTraceMessagePromise = undefined;
+    return msg;
+  })();
+
+  await session.toolTraceMessagePromise;
+}
+
 async function handleToolExecutionStart(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
   session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
   const toolName = typeof event.toolName === "string"
     ? event.toolName
     : typeof event.tool === "string"
       ? event.tool
       : "tool";
   const id = executionIdForEvent(event, toolName);
-  const trace: ToolTraceState = {
+  const trace: ToolExecutionTrace = {
     id,
     toolName,
     args: event.args ?? event.input,
     intent: typeof event.intent === "string" ? event.intent : undefined,
     phase: "running",
     startedAt: Date.now(),
-    lastEditTimestamp: 0,
   };
   session.toolTraces.set(id, trace);
+  session.toolTraceHistory.push(trace);
   session.activeToolStatus = formatToolStatus(toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${toolIcon(toolName)} ${toolName}`, "running");
-  trace.message = await thread.send({ embeds: [formatToolExecutionEmbed(trace)] }).catch(() => undefined);
-  trace.lastEditTimestamp = Date.now();
+  await ensureToolTraceMessage(session, thread);
 }
 
 async function handleToolExecutionUpdate(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
   session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
   const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
   const id = executionIdForEvent(event, toolName);
-  const existing = session.toolTraces.get(id);
-  const trace: ToolTraceState = existing || {
-    id,
-    toolName,
-    phase: "running",
-    startedAt: Date.now(),
-    lastEditTimestamp: 0,
-  };
-  if (!existing) session.toolTraces.set(id, trace);
+  let trace = session.toolTraces.get(id);
+  if (!trace) {
+    trace = {
+      id,
+      toolName,
+      phase: "running",
+      startedAt: Date.now(),
+    };
+    session.toolTraces.set(id, trace);
+    session.toolTraceHistory.push(trace);
+  }
   trace.phase = "updated";
   const output = formatToolOutputPreview(toolOutputFromEvent(event));
   if (output) trace.outputPreview = output;
   session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
-  scheduleToolTraceEdit(trace);
+  await ensureToolTraceMessage(session, thread);
   await maybeSendVisualArtifact(session, thread, event, id);
 }
 
 async function handleToolExecutionEnd(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
   session.toolTraces ||= new Map();
+  session.toolTraceHistory ||= [];
   const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
   const id = executionIdForEvent(event, toolName);
-  const existing = session.toolTraces.get(id);
-  const trace = existing || {
-    id,
-    toolName,
-    phase: "running" as const,
-    startedAt: Date.now(),
-    lastEditTimestamp: 0,
-  };
-  if (!existing) session.toolTraces.set(id, trace);
+  let trace = session.toolTraces.get(id);
+  if (!trace) {
+    trace = {
+      id,
+      toolName,
+      phase: "running",
+      startedAt: Date.now(),
+    };
+    session.toolTraces.set(id, trace);
+    session.toolTraceHistory.push(trace);
+  }
   trace.endedAt = Date.now();
   trace.durationMs = trace.endedAt - trace.startedAt;
   trace.exitCode = toolExitCodeFromEvent(event);
   trace.outputPreview = formatToolOutputPreview(toolOutputFromEvent(event)) || trace.outputPreview;
   trace.error = typeof event.error === "string" ? event.error : trace.error;
   trace.phase = trace.error || (trace.exitCode != null && trace.exitCode !== 0) ? "failed" : "completed";
-  if (trace.message) await flushToolTrace(trace);
+  await ensureToolTraceMessage(session, thread);
   await maybeSendVisualArtifact(session, thread, event, id);
   session.toolTraces.delete(id);
-  const nextTrace = session.toolTraces.values().next().value as ToolTraceState | undefined;
-  session.activeToolStatus = nextTrace ? formatToolStatus(nextTrace.toolName, nextTrace.args, nextTrace.intent) : undefined;
-  updateHudActivity(session, thread, nextTrace ? `${toolIcon(nextTrace.toolName)} ${nextTrace.toolName}` : undefined, "running");
+  const nextRunningTrace = [...session.toolTraces.values()].reverse().find(
+    (t) => t.phase === "running" || t.phase === "updated",
+  );
+  session.activeToolStatus = nextRunningTrace
+    ? formatToolStatus(nextRunningTrace.toolName, nextRunningTrace.args, nextRunningTrace.intent)
+    : undefined;
+  updateHudActivity(
+    session,
+    thread,
+    nextRunningTrace ? `${toolIcon(nextRunningTrace.toolName)} ${nextRunningTrace.toolName}` : undefined,
+    "running",
+  );
 }
 
 async function maybeSendVisualArtifact(
@@ -1090,12 +1138,20 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    if (session.toolTraceEditTimer) {
+      clearTimeout(session.toolTraceEditTimer);
+      session.toolTraceEditTimer = undefined;
+    }
+    session.toolTraceMessage = undefined;
+    session.toolTraceMessagePromise = undefined;
+    session.toolTraceHistory = [];
+    session.toolTraces = new Map();
+    session.toolTraceLastEditTimestamp = 0;
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
     session.lastEditTimestamp = Date.now();
     updateHudActivity(session, thread, undefined, "running");
-    startTyping(session, thread);
     return;
   }
 
@@ -1320,7 +1376,7 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-
+    await flushToolTraceMessage(session);
     const components = [buildQuickActionRow(session.threadId)];
     if (session.activePromptMsg) {
       const full = session.currentStreamBuffer.trim();
@@ -1366,7 +1422,7 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-
+    await flushToolTraceMessage(session);
     const shouldAttachActionBar = !session.completionBarAttached || event.agentInvoked === false;
     if (shouldAttachActionBar) {
       if (session.activePromptMsg) {

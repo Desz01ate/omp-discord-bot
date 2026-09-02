@@ -149,31 +149,180 @@ export function formatToolOutputPreview(output: unknown): string {
   return singleLine.replace(/```/g, "``\\`");
 }
 
-export function formatToolExecutionEmbed(trace: ToolExecutionTrace): EmbedBuilder {
-  const icon = toolIcon(trace.toolName);
-  const status = trace.phase === "running"
-    ? "⏳ Running"
-    : trace.phase === "updated"
-      ? "🔄 Updating"
-      : trace.phase === "failed"
-        ? "❌ Failed"
-        : "✅ Completed";
-  const duration = trace.durationMs == null ? "—" : `${(trace.durationMs / 1000).toFixed(2)}s`;
-  const color = trace.phase === "failed" ? 0xed4245 : trace.phase === "completed" ? 0x57f287 : 0x5865f2;
-  const embed = new EmbedBuilder()
-    .setTitle(`${icon} ${trace.toolName}`)
-    .setColor(color)
-    .addFields(
-      { name: "Status", value: status, inline: true },
-      { name: "Duration", value: duration, inline: true },
-      ...(trace.exitCode !== undefined ? [{ name: "Exit", value: trace.exitCode == null ? "unknown" : String(trace.exitCode), inline: true }] : []),
-      ...(trace.intent ? [{ name: "Intent", value: trace.intent.slice(0, 1024), inline: false }] : []),
-      ...(trace.args !== undefined ? [{ name: "Input", value: `||\`\`\`json\n${formatToolArguments(trace.args)}\n\`\`\`||`, inline: false }] : []),
-      ...(trace.outputPreview ? [{ name: "Output Preview", value: `||\`\`\`\n${trace.outputPreview}\n\`\`\`||`, inline: false }] : []),
-      ...(trace.error ? [{ name: "Error", value: trace.error.slice(0, 1024), inline: false }] : []),
-    )
-    .setFooter({ text: `Trace ${trace.id}` });
+export function formatToolSummary(trace: ToolExecutionTrace): string {
+  if (trace.intent && trace.intent.trim()) {
+    return trace.intent.trim();
+  }
+  const args = trace.args;
+  if (!args) return "";
+  if (typeof args === "string") return args.trim();
+  if (typeof args === "object" && args !== null) {
+    const record = args as Record<string, unknown>;
+    for (const key of ["command", "path", "pattern", "query", "url", "file", "name", "title"]) {
+      if (typeof record[key] === "string" && record[key]) {
+        return `${key !== "command" && key !== "path" && key !== "url" ? `${key}: ` : ""}${record[key]}`;
+      }
+    }
+    try {
+      const serialized = JSON.stringify(record);
+      return serialized.length > 50 ? `${serialized.slice(0, 47)}...` : serialized;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+export function formatToolTracesEmbed(traces: ToolExecutionTrace[]): EmbedBuilder {
+  if (!traces || traces.length === 0) {
+    return new EmbedBuilder()
+      .setTitle("🛠️ Tool Traces")
+      .setColor(0x5865f2)
+      .setDescription("No tool calls recorded.")
+      .setFooter({ text: "Live tool execution tracing" });
+  }
+
+  const hasFailed = traces.some((t) => t.phase === "failed");
+  const isRunning = traces.some((t) => t.phase === "running" || t.phase === "updated");
+  const allCompleted = traces.every((t) => t.phase === "completed");
+
+  const color = hasFailed ? 0xed4245 : isRunning ? 0xf1c40f : allCompleted ? 0x57f287 : 0x5865f2;
+
+  const activeTrace =
+    [...traces].reverse().find((t) => t.phase === "running" || t.phase === "updated") ||
+    traces[traces.length - 1];
+
+  if (traces.length === 1) {
+    const icon = toolIcon(activeTrace.toolName);
+    const status =
+      activeTrace.phase === "running"
+        ? "⏳ Running"
+        : activeTrace.phase === "updated"
+          ? "🔄 Updating"
+          : activeTrace.phase === "failed"
+            ? "❌ Failed"
+            : "✅ Completed";
+    const duration = activeTrace.durationMs == null ? "—" : `${(activeTrace.durationMs / 1000).toFixed(2)}s`;
+    return new EmbedBuilder()
+      .setTitle(`${icon} ${activeTrace.toolName}`)
+      .setColor(color)
+      .addFields(
+        { name: "Status", value: status, inline: true },
+        { name: "Duration", value: duration, inline: true },
+        ...(activeTrace.exitCode !== undefined
+          ? [{ name: "Exit", value: activeTrace.exitCode == null ? "unknown" : String(activeTrace.exitCode), inline: true }]
+          : []),
+        ...(activeTrace.intent ? [{ name: "Intent", value: activeTrace.intent.slice(0, 1024), inline: false }] : []),
+        ...(activeTrace.error ? [{ name: "Error", value: activeTrace.error.slice(0, 1024), inline: false }] : []),
+      )
+      .setFooter({ text: `Trace ${activeTrace.id}` });
+  }
+
+  const icon = toolIcon(activeTrace.toolName);
+  let title: string;
+  if (isRunning) {
+    title = `🛠️ Tool Traces (${traces.length}) • ${icon} ${activeTrace.toolName}`;
+  } else if (hasFailed) {
+    const failCount = traces.filter((t) => t.phase === "failed").length;
+    title = `🛠️ Tool Traces (${traces.length} tools • ${failCount} failed)`;
+  } else {
+    title = `🛠️ Tool Traces (${traces.length} completed)`;
+  }
+
+  const embed = new EmbedBuilder().setTitle(title).setColor(color);
+
+  const maxVisible = 10;
+  let descriptionLines: string[] = [];
+  if (traces.length <= maxVisible) {
+    descriptionLines = traces.map((t, idx) => {
+      const tIcon = toolIcon(t.toolName);
+      const statusEmoji =
+        t.phase === "running"
+          ? "⏳"
+          : t.phase === "updated"
+            ? "🔄"
+            : t.phase === "failed"
+              ? "❌"
+              : "✅";
+      const dur =
+        t.durationMs != null
+          ? `${(t.durationMs / 1000).toFixed(2)}s`
+          : t.phase === "running" || t.phase === "updated"
+            ? "running"
+            : "—";
+      const summary = formatToolSummary(t);
+      const summaryStr = summary ? ` — \`${summary.replace(/`/g, "'").slice(0, 50)}\`` : "";
+      return `${idx + 1}. ${statusEmoji} ${tIcon} **${t.toolName}** (${dur})${summaryStr}`;
+    });
+  } else {
+    const omitted = traces.length - maxVisible;
+    const visible = traces.slice(-maxVisible);
+    descriptionLines.push(`*(... ${omitted} earlier tool call${omitted > 1 ? "s" : ""} omitted)*`);
+    descriptionLines.push(
+      ...visible.map((t, idx) => {
+        const actualIdx = traces.length - maxVisible + idx + 1;
+        const tIcon = toolIcon(t.toolName);
+        const statusEmoji =
+          t.phase === "running"
+            ? "⏳"
+            : t.phase === "updated"
+              ? "🔄"
+              : t.phase === "failed"
+                ? "❌"
+                : "✅";
+        const dur =
+          t.durationMs != null
+            ? `${(t.durationMs / 1000).toFixed(2)}s`
+            : t.phase === "running" || t.phase === "updated"
+              ? "running"
+              : "—";
+        const summary = formatToolSummary(t);
+        const summaryStr = summary ? ` — \`${summary.replace(/`/g, "'").slice(0, 50)}\`` : "";
+        return `${actualIdx}. ${statusEmoji} ${tIcon} **${t.toolName}** (${dur})${summaryStr}`;
+      }),
+    );
+  }
+  embed.setDescription(descriptionLines.join("\n"));
+
+  const statusLabel =
+    activeTrace.phase === "running"
+      ? "⏳ Running"
+      : activeTrace.phase === "updated"
+        ? "🔄 Updating"
+        : activeTrace.phase === "failed"
+          ? "❌ Failed"
+          : "✅ Completed";
+  const durationLabel = activeTrace.durationMs == null ? "—" : `${(activeTrace.durationMs / 1000).toFixed(2)}s`;
+  const latestHeading = isRunning
+    ? `⏳ Active Tool • ${icon} ${activeTrace.toolName}`
+    : `Latest Tool • ${icon} ${activeTrace.toolName}`;
+
+  let statusLine = `**Status**: ${statusLabel} • **Duration**: ${durationLabel}`;
+  if (activeTrace.exitCode !== undefined) {
+    statusLine += ` • **Exit**: \`${activeTrace.exitCode == null ? "unknown" : activeTrace.exitCode}\``;
+  }
+
+  embed.addFields(
+    { name: latestHeading, value: statusLine, inline: false },
+    ...(activeTrace.intent ? [{ name: "Intent", value: activeTrace.intent.slice(0, 1024), inline: false }] : []),
+    ...(activeTrace.args !== undefined
+      ? [{ name: "Input", value: `||\`\`\`json\n${formatToolArguments(activeTrace.args)}\n\`\`\`||`, inline: false }]
+      : []),
+    ...(activeTrace.outputPreview
+      ? [{ name: "Output Preview", value: `||\`\`\`\n${activeTrace.outputPreview}\n\`\`\`||`, inline: false }]
+      : []),
+    ...(activeTrace.error ? [{ name: "Error", value: activeTrace.error.slice(0, 1024), inline: false }] : []),
+  );
+
+  const totalDurationMs = traces.reduce((acc, t) => acc + (t.durationMs || 0), 0);
+  const totalDurationStr = totalDurationMs > 0 ? ` • Total tool time: ${(totalDurationMs / 1000).toFixed(2)}s` : "";
+  embed.setFooter({ text: `${traces.length} tool call${traces.length > 1 ? "s" : ""} in turn${totalDurationStr}` });
+
   return embed;
+}
+
+export function formatToolExecutionEmbed(trace: ToolExecutionTrace): EmbedBuilder {
+  return formatToolTracesEmbed([trace]);
 }
 
 function looksLikeImagePath(value: string): boolean {
