@@ -630,14 +630,9 @@ function createOmpSession(
     }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
-    if (session.toolTraceEditTimer) {
-      clearTimeout(session.toolTraceEditTimer);
-      session.toolTraceEditTimer = undefined;
-    }
     session.toolTraces?.clear();
     session.toolTraceHistory = [];
-    session.toolTraceMessage = undefined;
-    session.toolTraceMessagePromise = undefined;
+    session.activePromptMsg = undefined;
     void thread.send(`⚠️ OMP process exited (code ${code}).`).catch(() => {});
     void sessionManager.terminate(session, undefined, false);
   });
@@ -784,26 +779,35 @@ async function flushActivePromptMessage(session: SessionContext): Promise<void> 
   }
   if (!session.activePromptMsg) return;
 
-  const now = Date.now();
-  session.lastEditTimestamp = now;
+  session.lastEditTimestamp = Date.now();
 
-  let displayContent = "";
-  if (session.currentStreamBuffer) {
-    const textTail = session.currentStreamBuffer.slice(-1800);
-    if (session.activeToolStatus) {
-      displayContent = `${textTail}\n\n${session.activeToolStatus}`;
-    } else {
-      displayContent = textTail;
-    }
+  const hasTraces = session.toolTraceHistory && session.toolTraceHistory.length > 0;
+  const textTail = session.currentStreamBuffer ? session.currentStreamBuffer.slice(-1800) : "";
+
+  if (hasTraces) {
+    const embed = formatToolTracesEmbed(session.toolTraceHistory!);
+    await session.activePromptMsg
+      .edit({
+        content: textTail || null,
+        embeds: [embed],
+      })
+      .catch(() => {});
+  } else if (textTail) {
+    await session.activePromptMsg
+      .edit({
+        content: textTail,
+        embeds: [],
+      })
+      .catch(() => {});
   } else {
-    displayContent = session.activeToolStatus || "🤔 *Thinking...*";
+    const status = session.activeToolStatus || "🤔 *Thinking...*";
+    await session.activePromptMsg
+      .edit({
+        content: status,
+        embeds: [],
+      })
+      .catch(() => {});
   }
-
-  if (displayContent.length > 1950) {
-    displayContent = displayContent.slice(-1950);
-  }
-
-  await session.activePromptMsg.edit(displayContent).catch(() => {});
 }
 /**
  * Start or refresh typing indicator in Discord thread.
@@ -880,55 +884,6 @@ function updateHudActivity(session: SessionContext, thread: ThreadChannel, activ
   } as unknown as Record<string, unknown>;
   scheduleHudUpdate(session, thread);
 }
-async function flushToolTraceMessage(session: SessionContext): Promise<void> {
-  if (session.toolTraceEditTimer) {
-    clearTimeout(session.toolTraceEditTimer);
-    session.toolTraceEditTimer = undefined;
-  }
-  if (!session.toolTraceMessage || !session.toolTraceHistory || session.toolTraceHistory.length === 0) return;
-  const embed = formatToolTracesEmbed(session.toolTraceHistory);
-  await session.toolTraceMessage.edit({ embeds: [embed] }).catch(() => {});
-  session.toolTraceLastEditTimestamp = Date.now();
-}
-
-function scheduleToolTraceMessageEdit(session: SessionContext): void {
-  if (!session.toolTraceMessage) return;
-  const elapsed = Date.now() - (session.toolTraceLastEditTimestamp || 0);
-  if (elapsed >= OBSERVABILITY_UPDATE_THROTTLE_MS) {
-    void flushToolTraceMessage(session);
-  } else if (!session.toolTraceEditTimer) {
-    session.toolTraceEditTimer = setTimeout(() => {
-      void flushToolTraceMessage(session);
-    }, OBSERVABILITY_UPDATE_THROTTLE_MS - elapsed);
-  }
-}
-
-async function ensureToolTraceMessage(session: SessionContext, thread: ThreadChannel): Promise<void> {
-  session.toolTraceHistory ||= [];
-  session.toolTraces ||= new Map();
-
-  if (session.toolTraceMessage) {
-    scheduleToolTraceMessageEdit(session);
-    return;
-  }
-
-  if (session.toolTraceMessagePromise) {
-    await session.toolTraceMessagePromise;
-    scheduleToolTraceMessageEdit(session);
-    return;
-  }
-
-  session.toolTraceMessagePromise = (async () => {
-    const embed = formatToolTracesEmbed(session.toolTraceHistory || []);
-    const msg = await thread.send({ embeds: [embed] }).catch(() => undefined);
-    session.toolTraceMessage = msg;
-    session.toolTraceLastEditTimestamp = Date.now();
-    session.toolTraceMessagePromise = undefined;
-    return msg;
-  })();
-
-  await session.toolTraceMessagePromise;
-}
 
 async function handleToolExecutionStart(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
   session.toolTraces ||= new Map();
@@ -951,7 +906,7 @@ async function handleToolExecutionStart(session: SessionContext, thread: ThreadC
   session.toolTraceHistory.push(trace);
   session.activeToolStatus = formatToolStatus(toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${toolIcon(toolName)} ${toolName}`, "running");
-  await ensureToolTraceMessage(session, thread);
+  scheduleActivePromptUpdate(session);
 }
 
 async function handleToolExecutionUpdate(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
@@ -975,7 +930,7 @@ async function handleToolExecutionUpdate(session: SessionContext, thread: Thread
   if (output) trace.outputPreview = output;
   session.activeToolStatus = formatToolStatus(trace.toolName, trace.args, trace.intent);
   updateHudActivity(session, thread, `${toolIcon(trace.toolName)} ${trace.toolName}`, "running");
-  await ensureToolTraceMessage(session, thread);
+  scheduleActivePromptUpdate(session);
 }
 
 async function handleToolExecutionEnd(session: SessionContext, thread: ThreadChannel, event: Record<string, unknown>): Promise<void> {
@@ -1000,7 +955,7 @@ async function handleToolExecutionEnd(session: SessionContext, thread: ThreadCha
   trace.outputPreview = formatToolOutputPreview(toolOutputFromEvent(event)) || trace.outputPreview;
   trace.error = typeof event.error === "string" ? event.error : trace.error;
   trace.phase = trace.error || (trace.exitCode != null && trace.exitCode !== 0) ? "failed" : "completed";
-  await ensureToolTraceMessage(session, thread);
+  scheduleActivePromptUpdate(session);
   session.toolTraces.delete(id);
   const nextRunningTrace = [...session.toolTraces.values()].reverse().find(
     (t) => t.phase === "running" || t.phase === "updated",
@@ -1076,15 +1031,8 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    if (session.toolTraceEditTimer) {
-      clearTimeout(session.toolTraceEditTimer);
-      session.toolTraceEditTimer = undefined;
-    }
-    session.toolTraceMessage = undefined;
-    session.toolTraceMessagePromise = undefined;
     session.toolTraceHistory = [];
     session.toolTraces = new Map();
-    session.toolTraceLastEditTimestamp = 0;
     session.currentStreamBuffer = "";
     session.activeToolStatus = undefined;
     session.activePromptMsg = await thread.send("🤔 *Thinking...*");
@@ -1308,23 +1256,23 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    await flushToolTraceMessage(session);
     const components = [buildQuickActionRow(session.threadId)];
+    const full = session.currentStreamBuffer.trim();
+    const responseText = full || "✅ *Completed.*";
+    const chunks = splitDiscordMessage(responseText, 1950);
+
     if (session.activePromptMsg) {
-      const full = session.currentStreamBuffer.trim();
-      if (full) {
-        const chunks = splitDiscordMessage(full, 1950);
-        await session.activePromptMsg.edit({ content: chunks[0], components }).catch(() => {});
-        for (let i = 1; i < chunks.length; i++) {
-          await thread.send(chunks[i]).catch(() => {});
-        }
-      } else {
-        await session.activePromptMsg
-          .edit({ content: "✅ *Completed.*", components })
-          .catch(() => {});
+      await session.activePromptMsg
+        .edit({ content: chunks[0], embeds: [], components })
+        .catch(() => {});
+      for (let i = 1; i < chunks.length; i++) {
+        await thread.send(chunks[i]).catch(() => {});
       }
     } else {
-      await thread.send({ content: "✅ *Completed.*", components }).catch(() => {});
+      await thread.send({ content: chunks[0], components }).catch(() => {});
+      for (let i = 1; i < chunks.length; i++) {
+        await thread.send(chunks[i]).catch(() => {});
+      }
     }
 
     session.completionBarAttached = true;
@@ -1352,14 +1300,8 @@ async function handleRpcEvent(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
-    await flushToolTraceMessage(session);
     const shouldAttachActionBar = !session.completionBarAttached || event.agentInvoked === false;
     if (shouldAttachActionBar) {
-      if (session.activePromptMsg) {
-        await session.activePromptMsg.delete().catch(() => {});
-        session.activePromptMsg = undefined;
-      }
-
       const resultText = typeof event.result === "string"
         ? event.result.trim()
         : typeof event.message === "string"
@@ -1367,11 +1309,21 @@ async function handleRpcEvent(
           : "";
       const summary = resultText || "✅ *Completed.*";
       const chunks = splitDiscordMessage(summary, 1950);
-      await thread
-        .send({ content: chunks[0], components: [buildQuickActionRow(session.threadId)] })
-        .catch(() => {});
-      for (let i = 1; i < chunks.length; i++) {
-        await thread.send(chunks[i]).catch(() => {});
+      const components = [buildQuickActionRow(session.threadId)];
+
+      if (session.activePromptMsg) {
+        await session.activePromptMsg
+          .edit({ content: chunks[0], embeds: [], components })
+          .catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await thread.send(chunks[i]).catch(() => {});
+        }
+        session.activePromptMsg = undefined;
+      } else {
+        await thread.send({ content: chunks[0], components }).catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await thread.send(chunks[i]).catch(() => {});
+        }
       }
       session.completionBarAttached = true;
     }

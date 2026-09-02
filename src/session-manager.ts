@@ -37,12 +37,7 @@ export interface SessionContext {
   hudInitPromise?: Promise<void>;
   hudLastEditTimestamp?: number;
   hudState?: Record<string, unknown>;
-  /** Single tool trace message and throttled update state for the current turn. */
-  toolTraceMessage?: Message;
-  toolTraceMessagePromise?: Promise<Message | undefined>;
   toolTraceHistory?: ToolExecutionTrace[];
-  toolTraceEditTimer?: Timer;
-  toolTraceLastEditTimestamp?: number;
   /** Active tool traces keyed by the RPC execution/call id. */
   toolTraces?: Map<string, ToolExecutionTrace>;
 }
@@ -176,14 +171,8 @@ export class SessionManager {
         clearTimeout(session.hudUpdateTimer);
         session.hudUpdateTimer = undefined;
       }
-      if (session.toolTraceEditTimer) {
-        clearTimeout(session.toolTraceEditTimer);
-        session.toolTraceEditTimer = undefined;
-      }
       session.toolTraces?.clear();
       session.toolTraceHistory = [];
-      session.toolTraceMessage = undefined;
-      session.toolTraceMessagePromise = undefined;
       try {
         session.process.kill();
       } catch (err) {
