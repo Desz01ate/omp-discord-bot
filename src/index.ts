@@ -1094,11 +1094,29 @@ client.on("interactionCreate", async (interaction) => {
     await interaction.deferReply();
 
     try {
-      const thread = await textChannel.threads.create({
-        name: threadName,
-        autoArchiveDuration: 1440,
-      });
+      const createPrivateThreads = process.env.CREATE_PRIVATE_THREADS !== "false";
+      let thread: ThreadChannel;
 
+      if (createPrivateThreads && textChannel.type === ChannelType.GuildText) {
+        try {
+          thread = await textChannel.threads.create({
+            name: threadName,
+            type: ChannelType.PrivateThread,
+            autoArchiveDuration: 1440,
+          });
+        } catch (privErr) {
+          console.warn("Could not create private thread (missing permission?), falling back to public thread:", privErr);
+          thread = await textChannel.threads.create({
+            name: threadName,
+            autoArchiveDuration: 1440,
+          });
+        }
+      } else {
+        thread = await textChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 1440,
+        });
+      }
       const session = createOmpSession(thread, cwd, inputModel || undefined);
       sessions.set(thread.id, session);
 
