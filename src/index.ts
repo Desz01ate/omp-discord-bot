@@ -55,6 +55,8 @@ interface SessionContext {
   lastEditTimestamp: number;
   activeToolStatus?: string;
   editTimer?: Timer;
+  initialStatePromise?: Promise<Record<string, unknown>>;
+  resolveInitialState?: (state: Record<string, unknown>) => void;
 }
 
 interface OmpCommandMeta {
@@ -83,6 +85,59 @@ function sendRpc(session: SessionContext, command: Record<string, unknown>): voi
   const line = JSON.stringify(command) + "\n";
   session.process.stdin.write(line);
   session.process.stdin.flush();
+}
+
+/**
+ * Detect git branch or short commit hash for a directory if it is a git repo.
+ */
+async function getGitBranch(cwd: string): Promise<string | null> {
+  try {
+    const branchProc = spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd,
+      stderr: "ignore",
+    });
+    const branch = (await new Response(branchProc.stdout).text()).trim();
+    if (branch && branch !== "HEAD") return branch;
+
+    const commitProc = spawn(["git", "rev-parse", "--short", "HEAD"], {
+      cwd,
+      stderr: "ignore",
+    });
+    const commit = (await new Response(commitProc.stdout).text()).trim();
+    return commit ? `detached@${commit}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Retrieve OMP advisor configuration (enabled status and assigned model role).
+ */
+async function getAdvisorConfig(cwd?: string): Promise<{ enabled: boolean; model: string | null }> {
+  try {
+    const [enabledProc, rolesProc] = [
+      spawn(["omp", "config", "get", "advisor.enabled"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
+      spawn(["omp", "config", "get", "modelRoles"], cwd ? { cwd, stderr: "ignore" } : { stderr: "ignore" }),
+    ];
+
+    const [enabledOut, rolesOut] = await Promise.all([
+      new Response(enabledProc.stdout).text(),
+      new Response(rolesProc.stdout).text(),
+    ]);
+
+    const enabled = enabledOut.trim() === "true";
+    let model: string | null = null;
+    try {
+      const roles = JSON.parse(rolesOut.trim());
+      if (roles && typeof roles === "object" && roles.advisor) {
+        model = String(roles.advisor);
+      }
+    } catch {}
+
+    return { enabled, model };
+  } catch {
+    return { enabled: false, model: null };
+  }
 }
 
 // Fetch available commands and models on startup
@@ -296,8 +351,19 @@ const client = new Client({
 });
 
 // Spawn OMP RPC instance for a thread
-function createOmpSession(thread: ThreadChannel, cwd: string): SessionContext {
-  const proc = spawn(["omp", "--mode", "rpc"], {
+function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: string): SessionContext {
+  let resolveInitialState: ((state: Record<string, unknown>) => void) | undefined;
+  const initialStatePromise = new Promise<Record<string, unknown>>((resolve) => {
+    resolveInitialState = resolve;
+    setTimeout(() => resolve({}), 3000);
+  });
+
+  const args = ["omp", "--mode", "rpc"];
+  if (initialModel) {
+    args.push(`--model=${initialModel}`);
+  }
+
+  const proc = spawn(args, {
     cwd,
     stdin: "pipe",
     stdout: "pipe",
@@ -310,6 +376,8 @@ function createOmpSession(thread: ThreadChannel, cwd: string): SessionContext {
     cwd,
     currentStreamBuffer: "",
     lastEditTimestamp: 0,
+    initialStatePromise,
+    resolveInitialState,
   };
 
   const nodeStdout = Readable.fromWeb(proc.stdout as unknown as WebReadableStream);
@@ -525,6 +593,10 @@ async function handleRpcEvent(
       type: "negotiate_protocol",
       protocolVersion: 2,
     });
+    sendRpc(session, {
+      id: "init_state",
+      type: "get_state",
+    });
     return;
   }
 
@@ -677,26 +749,46 @@ async function handleRpcEvent(
   // 7. Response frames (e.g. state / custom query results)
   if (type === "response" && event.command === "get_state" && event.data && typeof event.data === "object") {
     const data = event.data as Record<string, unknown>;
-    const model = data.model as { provider?: string; id?: string } | undefined;
-    const modelStr = model ? `${model.provider}/${model.id}` : "unknown";
-    const tokens = (data.contextUsage as { tokens?: number; contextWindow?: number; percent?: number }) || {};
+    if (session.resolveInitialState) {
+      session.resolveInitialState(data);
+      session.resolveInitialState = undefined;
+    }
 
-    const embed = new EmbedBuilder()
-      .setTitle("📊 OMP Session Status")
-      .setColor(0x5865f2)
-      .addFields(
-        { name: "Model", value: `\`${modelStr}\``, inline: true },
-        { name: "Thinking Level", value: `\`${String(data.thinkingLevel || "normal")}\``, inline: true },
-        { name: "Fast Mode", value: data.fastModeActive ? "⚡ Active" : "Off", inline: true },
-        {
-          name: "Context Usage",
-          value: tokens.tokens != null ? `${tokens.tokens.toLocaleString()} / ${tokens.contextWindow?.toLocaleString()} (${Math.round((tokens.percent || 0) * 100)}%)` : "N/A",
-          inline: false,
-        },
-        { name: "Messages", value: `${data.messageCount ?? 0} in session`, inline: true },
-      );
+    if (event.id === "status_req") {
+      const model = data.model as { provider?: string; id?: string; name?: string } | undefined;
+      const modelStr = model ? `${model.provider ? `${model.provider}/` : ""}${model.id}${model.name ? ` (${model.name})` : ""}` : "unknown";
+      const tokens = (data.contextUsage as { tokens?: number; contextWindow?: number; percent?: number }) || {};
 
-    await thread.send({ embeds: [embed] }).catch(() => {});
+      const [advisorConfig, branch] = await Promise.all([
+        getAdvisorConfig(session.cwd),
+        getGitBranch(session.cwd),
+      ]);
+
+      const advisorText = advisorConfig.enabled
+        ? `🟢 On${advisorConfig.model ? ` (\`${advisorConfig.model}\`)` : ""}`
+        : "🔴 Off";
+      const branchText = branch ? `\`${branch}\`` : "*None*";
+
+      const embed = new EmbedBuilder()
+        .setTitle("📊 OMP Session Status")
+        .setColor(0x5865f2)
+        .addFields(
+          { name: "🤖 Model", value: `\`${modelStr}\``, inline: true },
+          { name: "🧠 Thinking Level", value: `\`${String(data.thinkingLevel || "normal")}\``, inline: true },
+          { name: "⚡ Fast Mode", value: data.fastModeActive ? "⚡ Active" : "Off", inline: true },
+          { name: "🛡️ Advisor", value: advisorText, inline: true },
+          { name: "🌿 Git Branch", value: branchText, inline: true },
+          {
+            name: "Context Usage",
+            value: tokens.tokens != null ? `${tokens.tokens.toLocaleString()} / ${tokens.contextWindow?.toLocaleString()} (${Math.round((tokens.percent || 0) * 100)}%)` : "N/A",
+            inline: true,
+          },
+          { name: "📁 Directory", value: `\`${session.cwd}\``, inline: false },
+          { name: "💬 Messages", value: `${data.messageCount ?? 0} in session`, inline: true },
+        );
+
+      await thread.send({ embeds: [embed] }).catch(() => {});
+    }
     return;
   }
 
@@ -948,23 +1040,51 @@ client.on("interactionCreate", async (interaction) => {
         autoArchiveDuration: 1440,
       });
 
-      const session = createOmpSession(thread, cwd);
+      const session = createOmpSession(thread, cwd, inputModel || undefined);
       sessions.set(thread.id, session);
 
-      if (inputModel) {
-        sendRpc(session, {
-          id: `model_init_${Date.now()}`,
-          type: "prompt",
-          message: `/model ${inputModel}`,
-        });
-      }
+      const [state, advisorConfig, branch] = await Promise.all([
+        session.initialStatePromise,
+        getAdvisorConfig(cwd),
+        getGitBranch(cwd),
+      ]);
+
+      const modelData = (state?.model as { id?: string; name?: string; provider?: string } | undefined) || {};
+      const modelDisplay = modelData.id
+        ? `${modelData.provider ? `${modelData.provider}/` : ""}${modelData.id}${modelData.name ? ` (${modelData.name})` : ""}`
+        : (inputModel || "default");
+
+      const thinkingLevel = typeof state?.thinkingLevel === "string" ? state.thinkingLevel : "normal";
+      const fastMode = Boolean(state?.fastModeActive);
+
+      const advisorText = advisorConfig.enabled
+        ? `🟢 On${advisorConfig.model ? ` (\`${advisorConfig.model}\`)` : ""}`
+        : "🔴 Off";
+
+      const branchText = branch ? `\`${branch}\`` : "*None (not a git repo)*";
+
+      const sessionEmbed = new EmbedBuilder()
+        .setTitle("👋 OMP Session Active")
+        .setColor(0x5865f2)
+        .setDescription(
+          "Type directly in this thread to prompt the agent, or use slash commands (`/skill`, `/cmd`, `/model`, `/fast`, `/think`, `/compact`, `/status`, `/abort`).",
+        )
+        .addFields(
+          { name: "🤖 Active Model", value: `\`${modelDisplay}\``, inline: true },
+          { name: "🛡️ Advisor", value: advisorText, inline: true },
+          { name: "🌿 Git Branch", value: branchText, inline: true },
+          { name: "📁 Working Directory", value: `\`${cwd}\``, inline: false },
+          { name: "🧠 Thinking Level", value: `\`${thinkingLevel}\``, inline: true },
+          { name: "⚡ Fast Mode", value: fastMode ? "⚡ Active" : "Off", inline: true },
+        )
+        .setTimestamp();
 
       await interaction.editReply(
-        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\`${inputModel ? `\n🤖 Model: \`${inputModel}\`` : ""}`,
+        `🚀 Session started in <#${thread.id}>\n📁 Directory: \`${cwd}\`\n🤖 Model: \`${modelDisplay}\``,
       );
-      await thread.send(
-        `👋 **OMP Session Active**\nType in this thread or use slash commands (\`/skill\`, \`/cmd\`, \`/model\`, \`/fast\`, \`/think\`, \`/abort\`, \`/status\`).`,
-      );
+      await thread.send({
+        embeds: [sessionEmbed],
+      });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       await interaction.editReply(`Failed to start session: ${errorMsg}`);
