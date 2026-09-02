@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import type { Subprocess } from "bun";
 import type { SessionStore, SessionBinding } from "./storage";
 import { createSessionStore } from "./storage";
+import { removeGitWorktree, type WorktreeInfo } from "./workspace";
 
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
@@ -12,6 +13,7 @@ export interface SessionContext {
   process: OmpProcess;
   threadId: string;
   cwd: string;
+  worktree?: WorktreeInfo;
   activePromptMsg?: Message;
   currentStreamBuffer: string;
   lastEditTimestamp: number;
@@ -120,7 +122,10 @@ export class SessionManager {
       initialModel: options.initialModel,
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      metadata: options.metadata,
+      metadata: {
+        ...options.metadata,
+        ...(session.worktree ? { worktree: session.worktree } : {}),
+      },
     };
     await this.store.set(binding);
   }
@@ -137,7 +142,7 @@ export class SessionManager {
 
   /**
    * Full session termination: stops typing/timers, kills subprocess, cleans attachments, removes from memory and store,
-   * and optionally deletes Discord thread channel.
+   * removes a bot-created Git worktree, and optionally deletes Discord thread channel.
    */
   public async terminate(
     sessionOrThreadId: SessionContext | string,
@@ -159,6 +164,9 @@ export class SessionManager {
         console.error(`Error terminating OMP process for thread ${session.threadId}:`, err);
       }
       cleanThreadAttachments(session.cwd, session.threadId);
+      if (session.worktree) {
+        await removeGitWorktree(session.worktree);
+      }
     }
 
     if (deleteThread && client) {
@@ -196,7 +204,7 @@ export class SessionManager {
    */
   public async restoreAll(
     client: Client,
-    spawnSession: (thread: ThreadChannel, cwd: string, initialModel?: string) => SessionContext,
+    spawnSession: (thread: ThreadChannel, cwd: string, initialModel?: string, metadata?: Record<string, unknown>) => SessionContext,
   ): Promise<number> {
     const bindings = await this.store.list();
     if (bindings.length === 0) {
@@ -234,7 +242,7 @@ export class SessionManager {
           continue;
         }
 
-        const session = spawnSession(channel, binding.cwd, binding.initialModel);
+        const session = spawnSession(channel, binding.cwd, binding.initialModel, binding.metadata);
         this.activeSessions.set(channel.id, session);
         restoredCount++;
         console.log(`✅ Restored active OMP session for thread ${channel.id} ("${channel.name}") in ${binding.cwd}`);
