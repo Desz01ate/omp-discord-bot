@@ -70,7 +70,7 @@ describe("SessionManager Composite Service", () => {
     return { session, processKilled };
   }
 
-  function createMockThread(id: string, name = `thread-${id}`): MockThread {
+  function createMockThread(id: string, name = `thread-${ id }`): MockThread {
     const thread: MockThread = {
       id,
       name,
@@ -157,7 +157,7 @@ describe("SessionManager Composite Service", () => {
 
     const mockThreads = new Map<string, MockThread>();
     for (let i = 1; i <= 4; i++) {
-      const id = `thread_${i}`;
+      const id = `thread_${ i }`;
       const { session } = createMockSessionContext(id);
       await manager.register(session);
       mockThreads.set(id, createMockThread(id));
@@ -311,7 +311,7 @@ describe("SessionManager Composite Service", () => {
   it("resolves OMP session paths and cleans up session files and companion directories", () => {
     const ompSessionFile = join(testDir, "test_session_123.jsonl");
     const companionDir = join(testDir, "test_session_123");
-    writeFileSync(ompSessionFile, '{"type":"session","id":"uuid-123"}\n');
+    writeFileSync(ompSessionFile, '{ "type":"session","id":"uuid-123" }\n');
     mkdirSync(companionDir, { recursive: true });
     writeFileSync(join(companionDir, "log.txt"), "log data");
 
@@ -358,7 +358,7 @@ describe("SessionManager Composite Service", () => {
     await manager.init();
 
     const sessionFile = join(testDir, "to_terminate.jsonl");
-    writeFileSync(sessionFile, '{"type":"session","id":"to_terminate_uuid"}\n');
+    writeFileSync(sessionFile, '{ "type":"session","id":"to_terminate_uuid" }\n');
 
     const { session } = createMockSessionContext("t_term_omp");
     session.sessionFile = sessionFile;
@@ -383,7 +383,7 @@ describe("SessionManager Composite Service", () => {
     const proj = join(testDir, "proj_restore");
     mkdirSync(proj, { recursive: true });
     const sessFile = join(testDir, "restored.jsonl");
-    writeFileSync(sessFile, '{"type":"session"}\n');
+    writeFileSync(sessFile, '{ "type":"session" }\n');
 
     await store.set({
       threadId: "t_resume_thread",

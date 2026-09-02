@@ -46,8 +46,14 @@ omp-discord-bot/
 
 ## Development & Operational Commands
 
-### Typecheck & Verification
+### Lint & Typecheck
 ```bash
+# Check lint rules
+bun run lint
+
+# Automatically fix fixable lint issues
+bun run lint:fix
+
 # Type check without emitting JavaScript
 bun x tsc --noEmit
 ```

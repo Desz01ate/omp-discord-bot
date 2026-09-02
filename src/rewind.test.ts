@@ -297,7 +297,7 @@ describe("handleMessageEditAsRewind Orchestration", () => {
       id: "th_123",
       isThread: () => true,
       send: async (payload: unknown) => {
-        const id = `msg_${Date.now()}_${Math.random()}`;
+        const id = `msg_${ Date.now() }_${ Math.random() }`;
         let content = "";
         if (typeof payload === "string") {
           content = payload;
@@ -309,7 +309,9 @@ describe("handleMessageEditAsRewind Orchestration", () => {
           content,
           delete: async () => {
             const idx = channelMessages.findIndex((m) => m.id === id);
-            if (idx !== -1) channelMessages.splice(idx, 1);
+            if (idx !== -1) {
+              channelMessages.splice(idx, 1);
+            }
           },
           edit: async (upd: unknown) => {
             if (typeof upd === "string") {
@@ -327,7 +329,9 @@ describe("handleMessageEditAsRewind Orchestration", () => {
         cache: new Map(),
         fetch: async (id: string) => {
           const found = channelMessages.find((m) => m.id === id);
-          if (found) return found as unknown as Message;
+          if (found) {
+            return found as unknown as Message;
+          }
           return {
             id,
             delete: async () => {},
@@ -671,7 +675,7 @@ describe("handleMessageEditAsRewind Orchestration", () => {
   });
 });
 describe("Real OMP RPC Rewind Integration", () => {
-  it("branches and rewinds multi-turn conversation in real omp process", async () => {
+  it.skipIf(!Bun.which("omp"))("branches and rewinds multi-turn conversation in real omp process", async () => {
     const proc = Bun.spawn(["omp", "--mode", "rpc", "--no-session"], {
       stdin: "pipe",
       stdout: "pipe",
@@ -697,12 +701,16 @@ describe("Real OMP RPC Rewind Integration", () => {
       (async () => {
         while (true) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            break;
+          }
           buffer += decoder.decode(value);
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
           for (const line of lines) {
-            if (!line.trim()) continue;
+            if (!line.trim()) {
+              continue;
+            }
             try {
               const msg = JSON.parse(line) as Record<string, unknown>;
               if (msg.type === "ready") {

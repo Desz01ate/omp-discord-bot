@@ -48,8 +48,8 @@ describe("Attachment Processing", () => {
     expect(readFileSync(targetFile, "utf-8")).toBe(content);
 
     const promptText = "Analyze this project";
-    const combinedPrompt = `@${targetFile} ${promptText}`;
-    expect(combinedPrompt).toBe(`@${targetFile} Analyze this project`);
+    const combinedPrompt = `@${ targetFile } ${ promptText }`;
+    expect(combinedPrompt).toBe(`@${ targetFile } Analyze this project`);
   });
 
   it("cleans up thread attachments directory", () => {

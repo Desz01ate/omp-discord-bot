@@ -158,9 +158,9 @@ describe("multi-tool execution trace formatting (single message)", () => {
 
   it("truncates list description gracefully when exceeding 10 tools", () => {
     const traces: ToolExecutionTrace[] = Array.from({ length: 15 }, (_, i) => ({
-      id: `t_${i}`,
+      id: `t_${ i }`,
       toolName: "read",
-      args: { path: `file_${i}.ts` },
+      args: { path: `file_${ i }.ts` },
       phase: "completed" as const,
       startedAt: 1000 * i,
       endedAt: 1000 * i + 200,

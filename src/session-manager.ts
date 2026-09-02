@@ -124,7 +124,7 @@ export function cleanThreadAttachments(cwd: string, threadId: string): void {
       rmSync(primaryBaseDir, { recursive: true, force: true });
     }
   } catch (err) {
-    console.error(`Failed to clean primary attachment directory for thread ${threadId}:`, err);
+    console.error(`Failed to clean primary attachment directory for thread ${ threadId }:`, err);
   }
 
   try {
@@ -133,7 +133,7 @@ export function cleanThreadAttachments(cwd: string, threadId: string): void {
       rmSync(fallbackThreadDir, { recursive: true, force: true });
     }
   } catch (err) {
-    console.error(`Failed to clean fallback attachment directory for thread ${threadId}:`, err);
+    console.error(`Failed to clean fallback attachment directory for thread ${ threadId }:`, err);
   }
 }
 /**
@@ -160,7 +160,9 @@ export class SessionManager {
   }
 
   public async init(): Promise<void> {
-    if (this.isInitialized) return;
+    if (this.isInitialized) {
+      return;
+    }
     await this.store.init();
     this.isInitialized = true;
   }
@@ -219,8 +221,12 @@ export class SessionManager {
   ): Promise<void> {
     const session = this.activeSessions.get(threadId);
     if (session) {
-      if (updates.sessionId !== undefined) session.sessionId = updates.sessionId;
-      if (updates.sessionFile !== undefined) session.sessionFile = updates.sessionFile;
+      if (updates.sessionId !== undefined) {
+        session.sessionId = updates.sessionId;
+      }
+      if (updates.sessionFile !== undefined) {
+        session.sessionFile = updates.sessionFile;
+      }
     }
     const existing = await this.store.get(threadId);
     if (existing) {
@@ -243,7 +249,7 @@ export class SessionManager {
   public async remove(threadId: string): Promise<void> {
     this.activeSessions.delete(threadId);
     await this.store.delete(threadId).catch((err) => {
-      console.error(`Failed to delete session binding for thread ${threadId} from store:`, err);
+      console.error(`Failed to delete session binding for thread ${ threadId } from store:`, err);
     });
   }
 
@@ -286,7 +292,7 @@ export class SessionManager {
       try {
         session.process.kill();
       } catch (err) {
-        console.error(`Error terminating OMP process for thread ${session.threadId}:`, err);
+        console.error(`Error terminating OMP process for thread ${ session.threadId }:`, err);
       }
       cleanThreadAttachments(session.cwd, session.threadId);
       if (session.worktree) {
@@ -307,13 +313,13 @@ export class SessionManager {
           await channel.delete("Terminated via session manager");
         }
       } catch (err) {
-        console.error(`Error deleting thread ${threadId}:`, err);
+        console.error(`Error deleting thread ${ threadId }:`, err);
       }
     }
 
     this.activeSessions.delete(threadId);
     await this.store.delete(threadId).catch((err) => {
-      console.error(`Failed to delete session binding for thread ${threadId} from store:`, err);
+      console.error(`Failed to delete session binding for thread ${ threadId } from store:`, err);
     });
   }
 
@@ -323,7 +329,9 @@ export class SessionManager {
   public async terminateAll(client?: Client, deleteThreads = true): Promise<number> {
     const active = this.getActiveSessions();
     const count = active.length;
-    if (count === 0) return 0;
+    if (count === 0) {
+      return 0;
+    }
     await Promise.allSettled(active.map((s) => this.terminate(s, client, deleteThreads)));
     return count;
   }
@@ -348,17 +356,17 @@ export class SessionManager {
       return 0;
     }
 
-    console.log(`📦 Found ${bindings.length} persisted session(s). Restoring bindings...`);
+    console.log(`📦 Found ${ bindings.length } persisted session(s). Restoring bindings...`);
     let restoredCount = 0;
 
     for (const binding of bindings) {
       try {
         if (!existsSync(binding.cwd)) {
-          console.warn(`⚠️ Working directory for thread ${binding.threadId} no longer exists (${binding.cwd}). Cleaning up.`);
+          console.warn(`⚠️ Working directory for thread ${ binding.threadId } no longer exists (${ binding.cwd }). Cleaning up.`);
           const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
           if (worktree) {
             await removeGitWorktree(worktree).catch((err) => {
-              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+              console.error(`Failed to clean up orphaned worktree for thread ${ binding.threadId }:`, err);
             });
           }
           cleanThreadAttachments(binding.cwd, binding.threadId);
@@ -372,11 +380,11 @@ export class SessionManager {
           (await client.channels.fetch(binding.threadId).catch(() => null));
 
         if (!channel || !channel.isThread()) {
-          console.warn(`⚠️ Discord thread ${binding.threadId} is no longer accessible. Cleaning up.`);
+          console.warn(`⚠️ Discord thread ${ binding.threadId } is no longer accessible. Cleaning up.`);
           const worktree = binding.metadata?.worktree as WorktreeInfo | undefined;
           if (worktree) {
             await removeGitWorktree(worktree).catch((err) => {
-              console.error(`Failed to clean up orphaned worktree for thread ${binding.threadId}:`, err);
+              console.error(`Failed to clean up orphaned worktree for thread ${ binding.threadId }:`, err);
             });
           }
           cleanThreadAttachments(binding.cwd, binding.threadId);
@@ -386,7 +394,7 @@ export class SessionManager {
         }
 
         if (channel.archived || channel.locked) {
-          console.log(`ℹ️ Discord thread ${binding.threadId} is archived/locked. Skipping RPC spawn.`);
+          console.log(`ℹ️ Discord thread ${ binding.threadId } is archived/locked. Skipping RPC spawn.`);
           continue;
         }
 
@@ -402,17 +410,21 @@ export class SessionManager {
           binding.sessionId,
           binding.sessionFile,
         );
-        if (binding.sessionId && !session.sessionId) session.sessionId = binding.sessionId;
-        if (binding.sessionFile && !session.sessionFile) session.sessionFile = binding.sessionFile;
+        if (binding.sessionId && !session.sessionId) {
+          session.sessionId = binding.sessionId;
+        }
+        if (binding.sessionFile && !session.sessionFile) {
+          session.sessionFile = binding.sessionFile;
+        }
         this.activeSessions.set(channel.id, session);
         restoredCount++;
-        console.log(`✅ Restored active OMP session for thread ${channel.id} ("${channel.name}") in ${binding.cwd}`);
+        console.log(`✅ Restored active OMP session for thread ${ channel.id } ("${ channel.name }") in ${ binding.cwd }`);
       } catch (err) {
-        console.error(`Failed to restore session for thread ${binding.threadId}:`, err);
+        console.error(`Failed to restore session for thread ${ binding.threadId }:`, err);
       }
     }
 
-    console.log(`🚀 Session restoration complete: ${restoredCount}/${bindings.length} active session(s) bound.`);
+    console.log(`🚀 Session restoration complete: ${ restoredCount }/${ bindings.length } active session(s) bound.`);
     return restoredCount;
   }
 
