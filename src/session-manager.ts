@@ -7,6 +7,7 @@ import type { SessionStore, SessionBinding } from "./storage";
 import { createSessionStore } from "./storage";
 import { removeGitWorktree, type WorktreeInfo } from "./workspace";
 import type { ToolExecutionTrace } from "./observability";
+import type { TurnCheckpoint, PendingRpcRequest } from "./rewind";
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 export interface SessionContext {
@@ -41,6 +42,12 @@ export interface SessionContext {
   toolTraceHistory?: ToolExecutionTrace[];
   /** Active tool traces keyed by the RPC execution/call id. */
   toolTraces?: Map<string, ToolExecutionTrace>;
+  /** Checkpoints tracking user turns and associated assistant messages for rewind. */
+  checkpoints?: TurnCheckpoint[];
+  /** True when an edit-as-a-rewind operation is actively processing. */
+  isRewinding?: boolean;
+  /** Active pending RPC requests awaiting response frames. */
+  pendingRpcRequests?: Map<string, PendingRpcRequest>;
 }
 export interface SessionManagerOptions {
   store?: SessionStore;
@@ -268,6 +275,14 @@ export class SessionManager {
       }
       session.toolTraces?.clear();
       session.toolTraceHistory = [];
+      if (session.pendingRpcRequests) {
+        for (const [, req] of session.pendingRpcRequests) {
+          clearTimeout(req.timer);
+          req.reject(new Error("Session terminated"));
+        }
+        session.pendingRpcRequests.clear();
+      }
+      session.checkpoints = [];
       try {
         session.process.kill();
       } catch (err) {
