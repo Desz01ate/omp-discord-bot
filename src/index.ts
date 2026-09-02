@@ -982,6 +982,19 @@ client.on("messageCreate", (message) => {
   });
 });
 
+// Handle Thread Deletions to clean up OMP processes automatically
+client.on(Events.ThreadDelete, (thread) => {
+  const session = sessions.get(thread.id);
+  if (session) {
+    console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
+    try {
+      session.process.kill();
+    } catch (err) {
+      console.error(`Error terminating OMP process for deleted thread ${thread.id}:`, err);
+    }
+  }
+});
+
 client.on(Events.ClientReady, () => {
   console.log(`🤖 OMP Discord Bot is online as ${client.user?.tag}!`);
   if (allowedUserIds.size > 0) {

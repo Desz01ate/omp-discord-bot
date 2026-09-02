@@ -74,6 +74,7 @@ journalctl --user -u omp-discord-bot.service -f
 - The global `sessions` `Map<string, SessionContext>` indexes sessions strictly by `thread.id`.
 - Slash commands and chat messages outside an indexed thread channel must be rejected or redirected to create a session first (`/omp-new`).
 - When an `omp` subprocess exits (`proc.exited`), the session entry is deleted from the map and a notification is sent to the thread.
+- When a Discord thread is deleted (`Events.ThreadDelete`), the corresponding `omp` subprocess is killed automatically (`session.process.kill()`), triggering full memory and state cleanup.
 
 ### 2. OMP RPC Lifecycle & Protocol Negotiation
 - Subprocesses are spawned as `spawn(["omp", "--mode", "rpc"], { cwd, stdin: "pipe", stdout: "pipe", stderr: "inherit" })`.
