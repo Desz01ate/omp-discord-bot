@@ -37,6 +37,7 @@ export interface RewindContext {
   startTyping: (session: SessionContext, thread: ThreadChannel) => void;
   updateThreadNameFromPrompt?: (thread: ThreadChannel, prompt: string) => Promise<void>;
   sendRpc: (session: SessionContext, command: Record<string, unknown>) => void;
+  abortTimeoutMs?: number;
 }
 
 /**
@@ -82,19 +83,46 @@ export function recordAssistantMessage(session: SessionContext, messageId: strin
 
 /**
  * Synchronize session checkpoints with OMP branch messages list.
+ * Matches checkpoints to branch messages by content to avoid desync from internal slash commands.
  */
 export function syncCheckpointsWithBranchMessages(
   session: SessionContext,
   branchMessages: Array<{ entryId: string; text: string }>,
 ): void {
-  if (!session.checkpoints) return;
-  // If OMP has fewer user messages (e.g. after /undo or branch), prune excess checkpoints
-  if (branchMessages.length < session.checkpoints.length) {
-    session.checkpoints = session.checkpoints.slice(0, branchMessages.length);
+  if (!session.checkpoints || session.checkpoints.length === 0) return;
+
+  let branchIdx = 0;
+  const matchedCheckpoints: TurnCheckpoint[] = [];
+
+  for (const cp of session.checkpoints) {
+    let foundMatch = false;
+    const cpText = cp.promptText.trim();
+
+    while (branchIdx < branchMessages.length) {
+      const msg = branchMessages[branchIdx++];
+      const msgText = msg.text.trim();
+
+      // Check if this branch message corresponds to this user checkpoint
+      const isMatch =
+        msgText === cpText ||
+        (cpText.length > 0 && (msgText.endsWith(cpText) || msgText.includes(cpText))) ||
+        (cpText.length === 0 && !msgText.startsWith("/"));
+
+      if (isMatch) {
+        cp.entryId = msg.entryId;
+        matchedCheckpoints.push(cp);
+        foundMatch = true;
+        break;
+      }
+    }
+
+    if (!foundMatch) {
+      // Checkpoint not found in branch messages (e.g. transcript was rolled back or pruned)
+      break;
+    }
   }
-  for (let i = 0; i < branchMessages.length && i < session.checkpoints.length; i++) {
-    session.checkpoints[i].entryId = branchMessages[i].entryId;
-  }
+
+  session.checkpoints = matchedCheckpoints;
 }
 
 /**
@@ -118,13 +146,15 @@ export function pruneCheckpoints(session: SessionContext, fromIndex: number): Tu
 }
 
 /**
- * Persist current session checkpoints into SessionStore metadata.
+ * Persist current session checkpoints into SessionStore metadata and synchronize session identifiers.
  */
 export async function persistSessionCheckpoints(
   session: SessionContext,
   sessionManager: SessionManager,
 ): Promise<void> {
   await sessionManager.update(session.threadId, {
+    sessionId: session.sessionId,
+    sessionFile: session.sessionFile,
     metadata: {
       checkpoints: session.checkpoints,
     },
@@ -134,24 +164,47 @@ export async function persistSessionCheckpoints(
 }
 
 /**
- * Delete assistant messages associated with pruned checkpoints.
+ * Delete assistant messages associated with pruned checkpoints using bulk delete where possible.
  */
 export async function cleanupCheckpointsMessages(
   thread: ThreadChannel,
   checkpoints: TurnCheckpoint[],
 ): Promise<void> {
+  const allMsgIds: string[] = [];
   for (const cp of checkpoints) {
     if (cp.assistantMessageIds && cp.assistantMessageIds.length > 0) {
-      for (const msgId of cp.assistantMessageIds) {
-        try {
+      allMsgIds.push(...cp.assistantMessageIds);
+    }
+  }
+  if (allMsgIds.length === 0) return;
+
+  const uniqueIds = Array.from(new Set(allMsgIds));
+
+  let bulkDeleted = false;
+  if (typeof thread.bulkDelete === "function") {
+    try {
+      await thread.bulkDelete(uniqueIds);
+      bulkDeleted = true;
+    } catch {
+      bulkDeleted = false;
+    }
+  }
+
+  if (!bulkDeleted) {
+    for (const msgId of uniqueIds) {
+      try {
+        const mgr = thread.messages;
+        if (mgr && "delete" in mgr && typeof mgr.delete === "function") {
+          await (mgr.delete as (id: string) => Promise<unknown>)(msgId).catch(() => {});
+        } else {
           const msg =
             thread.messages.cache.get(msgId) ??
             (await thread.messages.fetch(msgId).catch(() => null));
           if (msg) {
             await msg.delete().catch(() => {});
           }
-        } catch {}
-      }
+        }
+      } catch {}
     }
   }
 }
@@ -204,7 +257,13 @@ export function sendRpcRequest<T = unknown>(
     timer,
     command: cmdName,
   });
-  sendRpcFn(session, fullCommand);
+  try {
+    sendRpcFn(session, fullCommand);
+  } catch (err) {
+    clearTimeout(timer);
+    session.pendingRpcRequests.delete(id);
+    reject(err);
+  }
   return promise;
 }
 
@@ -272,36 +331,44 @@ export async function handleMessageEditAsRewind(
     return false;
   }
 
-  const fullMessage = newMessage.partial
-    ? await newMessage.fetch().catch(() => null)
-    : (newMessage as Message);
-  if (!fullMessage) return false;
-
-  if (fullMessage.author.bot || !context.isUserAllowed(fullMessage.author.id)) return false;
-
   const checkpoints = session.checkpoints || [];
-  const cpIndex = checkpoints.findIndex((cp) => cp.discordMessageId === fullMessage.id);
+  const cpIndex = checkpoints.findIndex((cp) => cp.discordMessageId === newMessage.id);
   if (cpIndex === -1) {
     // Not a tracked user turn
     return false;
   }
 
   const checkpoint = checkpoints[cpIndex];
-  const newRawContent = fullMessage.content.trim();
-
-  // If content is identical and no attachments, ignore (embed unfurl or no-op edit)
-  if (newRawContent === checkpoint.promptText && fullMessage.attachments.size === 0) {
-    return false;
-  }
-
-  const { text, images } = await context.extractMessagePrompt(session, fullMessage);
-  if (!text && images.length === 0) {
+  if (!newMessage.partial && newMessage.content.trim() === checkpoint.promptText) {
     return false;
   }
 
   session.isRewinding = true;
 
   try {
+    const fullMessage = newMessage.partial
+      ? await newMessage.fetch().catch(() => null)
+      : (newMessage as Message);
+    if (!fullMessage) {
+      return false;
+    }
+
+    if (fullMessage.author.bot || !context.isUserAllowed(fullMessage.author.id)) {
+      return false;
+    }
+
+    const newRawContent = fullMessage.content.trim();
+
+    // If content is identical to tracked prompt, ignore (embed unfurl, pin, or no-op edit)
+    if (newRawContent === checkpoint.promptText) {
+      return false;
+    }
+
+    const { text, images } = await context.extractMessagePrompt(session, fullMessage);
+    if (!text && images.length === 0) {
+      return false;
+    }
+
     await fullMessage.react("↩️").catch(() => {});
     const isPastTurn = cpIndex < checkpoints.length - 1;
     const statusMsg = await channel
@@ -315,13 +382,17 @@ export async function handleMessageEditAsRewind(
     // Abort if currently running
     if (session.isRunning) {
       context.sendRpc(session, { type: "abort" });
-      await waitForTurnToStop(session, 5000);
+      const abortTimeout = context.abortTimeoutMs ?? 5000;
+      const stopped = await waitForTurnToStop(session, abortTimeout);
+      if (!stopped) {
+        await statusMsg?.edit("⚠️ *Previous turn could not be halted in time. Please try again.*").catch(() => {});
+        return false;
+      }
       if (session.activePromptMsg) {
         await session.activePromptMsg.delete().catch(() => {});
         session.activePromptMsg = undefined;
       }
     }
-
     // Resolve OMP entryId
     let entryId = checkpoint.entryId;
     try {
@@ -333,8 +404,11 @@ export async function handleMessageEditAsRewind(
       );
       if (branchData?.messages) {
         syncCheckpointsWithBranchMessages(session, branchData.messages);
-        if (branchData.messages.length > cpIndex) {
-          entryId = branchData.messages[cpIndex].entryId;
+        const matchedCheckpoint = session.checkpoints?.find(
+          (cp) => cp.discordMessageId === fullMessage.id,
+        );
+        if (matchedCheckpoint?.entryId) {
+          entryId = matchedCheckpoint.entryId;
         }
       }
     } catch (err) {

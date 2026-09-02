@@ -106,6 +106,36 @@ describe("Rewind & Checkpoints Unit Tests", () => {
     expect(session.checkpoints?.[1].entryId).toBe("e2");
   });
 
+  it("synchronizes checkpoints correctly even with intervening slash commands", () => {
+    const session = createMockSession();
+    recordUserTurnCheckpoint(session, "msg_1", "Hello world");
+    recordUserTurnCheckpoint(session, "msg_2", "Second question");
+
+    syncCheckpointsWithBranchMessages(session, [
+      { entryId: "e1", text: "Hello world" },
+      { entryId: "cmd_1", text: "/model gpt-5.5" },
+      { entryId: "cmd_2", text: "/fast on" },
+      { entryId: "e2", text: "Second question" },
+    ]);
+
+    expect(session.checkpoints?.length).toBe(2);
+    expect(session.checkpoints?.[0].entryId).toBe("e1");
+    expect(session.checkpoints?.[1].entryId).toBe("e2");
+  });
+
+  it("rejects and cleans up immediately if sendRpcFn throws synchronously", async () => {
+    const session = createMockSession();
+    const errorSend = () => {
+      throw new Error("Broken pipe");
+    };
+
+    await expect(
+      sendRpcRequest(session, { type: "test" }, 5000, errorSend),
+    ).rejects.toThrow("Broken pipe");
+
+    expect(session.pendingRpcRequests?.size).toBe(0);
+  });
+
   it("finds checkpoint index and prunes checkpoints correctly", () => {
     const session = createMockSession();
     recordUserTurnCheckpoint(session, "msg_1", "Turn 1");
@@ -208,9 +238,34 @@ describe("Rewind & Checkpoints Unit Tests", () => {
     await cleanupCheckpointsMessages(mockThread, checkpoints);
     expect(deletedIds).toEqual(["a1", "a2", "a3"]);
   });
+
+  it("cleans up assistant messages using bulkDelete when supported", async () => {
+    let bulkDeletedIds: string[] = [];
+    const mockThread = {
+      bulkDelete: async (ids: string[]) => {
+        bulkDeletedIds = ids;
+      },
+      messages: {
+        cache: new Map(),
+      },
+    } as unknown as ThreadChannel;
+
+    const checkpoints: TurnCheckpoint[] = [
+      {
+        discordMessageId: "u1",
+        promptText: "t1",
+        timestamp: Date.now(),
+        assistantMessageIds: ["a1", "a2", "a1"],
+      },
+    ];
+
+    await cleanupCheckpointsMessages(mockThread, checkpoints);
+    expect(bulkDeletedIds).toEqual(["a1", "a2"]);
+  });
 });
 
 describe("handleMessageEditAsRewind Orchestration", () => {
+  let store: InMemorySessionStore;
   let sessionManager: SessionManager;
   let session: SessionContext;
   let sentRpcCommands: Record<string, unknown>[];
@@ -223,7 +278,8 @@ describe("handleMessageEditAsRewind Orchestration", () => {
   let threadNameUpdated: string | null;
 
   beforeEach(async () => {
-    sessionManager = new SessionManager({ store: new InMemorySessionStore() });
+    store = new InMemorySessionStore();
+    sessionManager = new SessionManager({ store });
     await sessionManager.init();
 
     sentRpcCommands = [];
@@ -330,6 +386,59 @@ describe("handleMessageEditAsRewind Orchestration", () => {
     expect(await handleMessageEditAsRewind(message, message, context)).toBe(false);
   });
 
+  it("ignores edits when content did not change even with attachments", async () => {
+    const thread = createMockThread();
+    recordUserTurnCheckpoint(session, "msg_1", "Original text");
+
+    const context: RewindContext = {
+      sessionManager,
+      isUserAllowed: () => true,
+      extractMessagePrompt: async () => ({ text: "Original text", images: [] }),
+      startTyping: () => {},
+      sendRpc: () => {},
+    };
+
+    const messageWithAttachment = {
+      id: "msg_1",
+      author: { bot: false, id: "user_1" },
+      channel: thread,
+      content: "Original text",
+      attachments: new Map([["att_1", { url: "https://example.com/img.png" }]]),
+    } as unknown as Message;
+
+    expect(await handleMessageEditAsRewind(messageWithAttachment, messageWithAttachment, context)).toBe(false);
+  });
+
+  it("halts rewind safely if in-flight turn cannot be stopped in time", async () => {
+    const thread = createMockThread();
+    recordUserTurnCheckpoint(session, "msg_1", "Prompt 1");
+    session.isRunning = true;
+
+    const context: RewindContext = {
+      sessionManager,
+      isUserAllowed: () => true,
+      extractMessagePrompt: async () => ({ text: "Prompt 1 Edited", images: [] }),
+      startTyping: () => {},
+      sendRpc: () => {
+        // Intentionally keep isRunning = true
+      },
+      abortTimeoutMs: 100,
+    };
+
+    const editedMessage = {
+      id: "msg_1",
+      author: { bot: false, id: "user_1" },
+      channel: thread,
+      content: "Prompt 1 Edited",
+      attachments: new Map(),
+      react: async () => {},
+    } as unknown as Message;
+
+    const result = await handleMessageEditAsRewind(editedMessage, editedMessage, context);
+    expect(result).toBe(false);
+    expect(session.isRewinding).toBe(false);
+  });
+
   it("rewinds to checkpoint, deletes orphaned assistant messages, branches, and resubmits", async () => {
     const thread = createMockThread();
     recordUserTurnCheckpoint(session, "msg_1", "Prompt 1");
@@ -402,10 +511,12 @@ describe("handleMessageEditAsRewind Orchestration", () => {
     const branchCmd = sentRpcCommands.find((c) => c.type === "branch");
     expect(branchCmd).toBeDefined();
     expect(branchCmd?.entryId).toBe("e2");
-
-    // Verify state was refreshed
+    // Verify state was refreshed in memory and persistent store
     expect(session.sessionId).toBe("sess_new");
     expect(session.sessionFile).toBe("/tmp/sess_new.jsonl");
+    const persistedBinding = await store.get(session.threadId);
+    expect(persistedBinding?.sessionId).toBe("sess_new");
+    expect(persistedBinding?.sessionFile).toBe("/tmp/sess_new.jsonl");
 
     // Verify new prompt was submitted
     const promptCmd = sentRpcCommands.find(
@@ -418,6 +529,73 @@ describe("handleMessageEditAsRewind Orchestration", () => {
     expect(session.checkpoints?.[0].discordMessageId).toBe("msg_1");
     expect(session.checkpoints?.[1].discordMessageId).toBe("msg_2");
     expect(session.checkpoints?.[1].promptText).toBe("Prompt 2 Edited!");
+  });
+
+  it("rewinds to correct entryId even when branch messages contain intervening slash commands", async () => {
+    const thread = createMockThread();
+    recordUserTurnCheckpoint(session, "msg_1", "Prompt 1");
+    recordUserTurnCheckpoint(session, "msg_2", "Prompt 2");
+
+    const context: RewindContext = {
+      sessionManager,
+      isUserAllowed: () => true,
+      extractMessagePrompt: async (_s, m) => ({ text: m.content, images: [] }),
+      startTyping: () => {},
+      sendRpc: (s, cmd) => {
+        sentRpcCommands.push(cmd);
+        queueMicrotask(() => {
+          if (cmd.type === "get_branch_messages") {
+            resolvePendingRpcResponse(s, {
+              id: cmd.id,
+              type: "response",
+              command: "get_branch_messages",
+              success: true,
+              data: {
+                messages: [
+                  { entryId: "e1", text: "Prompt 1" },
+                  { entryId: "slash_cmd_1", text: "/model gpt-5.5" },
+                  { entryId: "slash_cmd_2", text: "/cmd git status" },
+                  { entryId: "e2_actual", text: "Prompt 2" },
+                ],
+              },
+            });
+          } else if (cmd.type === "branch") {
+            resolvePendingRpcResponse(s, {
+              id: cmd.id,
+              type: "response",
+              command: "branch",
+              success: true,
+              data: { text: "Old prompt", cancelled: false },
+            });
+          } else if (cmd.type === "get_state") {
+            resolvePendingRpcResponse(s, {
+              id: cmd.id,
+              type: "response",
+              command: "get_state",
+              success: true,
+              data: { sessionId: "sess_new_2" },
+            });
+          }
+        });
+      },
+    };
+
+    const editedMessage = {
+      id: "msg_2",
+      author: { bot: false, id: "user_1" },
+      channel: thread,
+      content: "Prompt 2 Rewound!",
+      attachments: new Map(),
+      react: async () => {},
+    } as unknown as Message;
+
+    const result = await handleMessageEditAsRewind(editedMessage, editedMessage, context);
+    expect(result).toBe(true);
+
+    const branchCmd = sentRpcCommands.find((c) => c.type === "branch");
+    expect(branchCmd).toBeDefined();
+    // Must branch to e2_actual (matched by checkpoint), NOT slash_cmd_1 (index 1)
+    expect(branchCmd?.entryId).toBe("e2_actual");
   });
 
   it("rewinds turn 1 and updates thread name", async () => {

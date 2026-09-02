@@ -651,6 +651,13 @@ function createOmpSession(
       clearTimeout(session.editTimer);
       session.editTimer = undefined;
     }
+    if (session.pendingRpcRequests) {
+      for (const [, req] of session.pendingRpcRequests) {
+        clearTimeout(req.timer);
+        req.reject(new Error(`OMP process exited with code ${code}`));
+      }
+      session.pendingRpcRequests.clear();
+    }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
     session.toolTraces?.clear();
@@ -2206,7 +2213,10 @@ client.on("messageCreate", async (message) => {
   if (!isUserAllowed(message.author.id)) return;
   const session = sessionManager.get(message.channelId);
   if (!session) return;
-  if (session.isRewinding) return;
+  if (session.isRewinding) {
+    await message.reply("⏳ *Session is currently rewinding. Please wait a moment before sending new messages.*").catch(() => {});
+    return;
+  }
 
   const { text, images } = await extractMessagePrompt(session, message);
   if (!text && images.length === 0) {
