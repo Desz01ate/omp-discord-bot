@@ -12,7 +12,7 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
   - `/skill <name> <prompt>` — Rich autocomplete for all OMX workflows (`$ralph`, `$plan`, `$deep-interview`, `$code-review`, `$tdd`, etc.).
   - `/cmd <command> [args]` — Rich autocomplete for all 102+ native OMP commands and subcommands (`/security`, `/advisor`, `/prewalk`, `/dump`, etc.).
   - `/model [selection]` — Real-time model switcher with context window indicators.
-  - `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
+  - `/omp-new`, `/omp-terminate-all`, `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
 - **Interactive UI Approvals**: Confirmation requests (`extension_ui_request`) render as Discord **Action Buttons** (`Approve` / `Deny`) with timeout handling.
 - **Systemd User Service & Docker**: One-command daemonization via `./scripts/init.sh` or isolated containerized deployment with `docker compose`.
 
@@ -139,6 +139,7 @@ journalctl --user -u omp-discord-bot.service -f
 | Command | Description |
 |---|---|
 | `/omp-new [directory]` | Spawns a new OMP session rooted in `directory` (default: cwd) and creates a dedicated Discord thread `🧵 <directory_name> ($session_id)`. |
+| `/omp-terminate-all` | Terminates all active on-server OMP sessions and deletes their associated Discord threads. |
 | `/abort` | Interrupts and cancels the currently running model turn in the active thread. |
 | `/status` | Displays an embed with active model, thinking level, fast mode state, token budget, and message count. |
 | `/compact [instructions]` | Compacts conversation context with optional instructions. |

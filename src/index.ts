@@ -252,6 +252,10 @@ function buildSlashCommands() {
           .setRequired(false),
       ),
 
+    new SlashCommandBuilder()
+      .setName("omp-terminate-all")
+      .setDescription("Terminate all active OMP sessions and delete their Discord threads"),
+
     // 2. Skill runner with rich autocomplete
     new SlashCommandBuilder()
       .setName("skill")
@@ -428,6 +432,65 @@ function createOmpSession(thread: ThreadChannel, cwd: string, initialModel?: str
   });
 
   return session;
+}
+
+function cleanThreadAttachments(session: SessionContext): void {
+  try {
+    const primaryThreadDir = join(session.cwd, ".discord-attachments", session.threadId);
+    if (existsSync(primaryThreadDir)) {
+      rmSync(primaryThreadDir, { recursive: true, force: true });
+    }
+    const primaryBaseDir = join(session.cwd, ".discord-attachments");
+    if (existsSync(primaryBaseDir) && readdirSync(primaryBaseDir).length === 0) {
+      rmSync(primaryBaseDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.error(`Failed to clean primary attachment directory for thread ${session.threadId}:`, err);
+  }
+
+  try {
+    const fallbackThreadDir = join(tmpdir(), "omp-discord-attachments", session.threadId);
+    if (existsSync(fallbackThreadDir)) {
+      rmSync(fallbackThreadDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    console.error(`Failed to clean fallback attachment directory for thread ${session.threadId}:`, err);
+  }
+}
+
+async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
+  stopTyping(session);
+  if (session.editTimer) {
+    clearTimeout(session.editTimer);
+    session.editTimer = undefined;
+  }
+
+  try {
+    session.process.kill();
+  } catch (err) {
+    console.error(`Error terminating OMP process for thread ${session.threadId}:`, err);
+  }
+
+  try {
+    cleanThreadAttachments(session);
+  } catch (err) {
+    console.error(`Error cleaning attachments for thread ${session.threadId}:`, err);
+  }
+
+  if (deleteThread) {
+    try {
+      const channel =
+        client.channels.cache.get(session.threadId) ??
+        (await client.channels.fetch(session.threadId).catch(() => null));
+      if (channel && channel.isThread()) {
+        await channel.delete("Terminated via /omp-terminate-all");
+      }
+    } catch (err) {
+      console.error(`Error deleting thread ${session.threadId}:`, err);
+    }
+  }
+
+  sessions.delete(session.threadId);
 }
 
 /**
@@ -1169,6 +1232,33 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  // Terminate All Sessions
+  if (interaction.commandName === "omp-terminate-all") {
+    const activeSessions = Array.from(sessions.values());
+    if (activeSessions.length === 0) {
+      await interaction.reply({
+        content: "ℹ️ No active OMP sessions found.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+    const count = activeSessions.length;
+    console.log(`🛑 /omp-terminate-all requested: Terminating ${count} active session(s)...`);
+
+    await Promise.allSettled(activeSessions.map((s) => terminateSession(s, true)));
+
+    try {
+      await interaction.editReply(
+        `🛑 Successfully terminated ${count} active OMP session${count === 1 ? "" : "s"} and deleted associated Discord thread${count === 1 ? "" : "s"}.`,
+      );
+    } catch {
+      // Channel might have been deleted if command was run inside one of the terminated threads
+    }
+    return;
+  }
+
   // Session-bound Slash Commands
   const session = sessions.get(interaction.channelId);
   if (!session) {
@@ -1403,29 +1493,6 @@ async function saveNonImageAttachment(
   }
 }
 
-function cleanThreadAttachments(session: SessionContext): void {
-  try {
-    const primaryThreadDir = join(session.cwd, ".discord-attachments", session.threadId);
-    if (existsSync(primaryThreadDir)) {
-      rmSync(primaryThreadDir, { recursive: true, force: true });
-    }
-    const primaryBaseDir = join(session.cwd, ".discord-attachments");
-    if (existsSync(primaryBaseDir) && readdirSync(primaryBaseDir).length === 0) {
-      rmSync(primaryBaseDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean primary attachment directory for thread ${session.threadId}:`, err);
-  }
-
-  try {
-    const fallbackThreadDir = join(tmpdir(), "omp-discord-attachments", session.threadId);
-    if (existsSync(fallbackThreadDir)) {
-      rmSync(fallbackThreadDir, { recursive: true, force: true });
-    }
-  } catch (err) {
-    console.error(`Failed to clean fallback attachment directory for thread ${session.threadId}:`, err);
-  }
-}
 
 // Handle Chat Messages in Threads
 client.on("messageCreate", async (message) => {
@@ -1477,18 +1544,8 @@ client.on("messageCreate", async (message) => {
 client.on(Events.ThreadDelete, (thread) => {
   const session = sessions.get(thread.id);
   if (session) {
-    stopTyping(session);
     console.log(`🗑️ Thread ${thread.id} ("${thread.name}") deleted. Terminating OMP session...`);
-    try {
-      session.process.kill();
-    } catch (err) {
-      console.error(`Error terminating OMP process for deleted thread ${thread.id}:`, err);
-    }
-    try {
-      cleanThreadAttachments(session);
-    } catch (err) {
-      console.error(`Error cleaning attachments for thread ${thread.id}:`, err);
-    }
+    void terminateSession(session, false);
   }
 });
 
