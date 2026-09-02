@@ -200,12 +200,6 @@ export function formatToolTracesEmbed(traces: ToolExecutionTrace[]): EmbedBuilde
           ? [{ name: "Exit", value: activeTrace.exitCode == null ? "unknown" : String(activeTrace.exitCode), inline: true }]
           : []),
         ...(activeTrace.intent ? [{ name: "Intent", value: activeTrace.intent.slice(0, 1024), inline: false }] : []),
-        ...(activeTrace.args !== undefined
-          ? [{ name: "Input", value: `||\`\`\`json\n${formatToolArguments(activeTrace.args)}\n\`\`\`||`, inline: false }]
-          : []),
-        ...(activeTrace.outputPreview
-          ? [{ name: "Output Preview", value: `||\`\`\`\n${activeTrace.outputPreview}\n\`\`\`||`, inline: false }]
-          : []),
         ...(activeTrace.error ? [{ name: "Error", value: activeTrace.error.slice(0, 1024), inline: false }] : []),
       )
       .setFooter({ text: `Trace ${activeTrace.id}` });
@@ -298,12 +292,6 @@ export function formatToolTracesEmbed(traces: ToolExecutionTrace[]): EmbedBuilde
   embed.addFields(
     { name: latestHeading, value: statusLine, inline: false },
     ...(activeTrace.intent ? [{ name: "Intent", value: activeTrace.intent.slice(0, 1024), inline: false }] : []),
-    ...(activeTrace.args !== undefined
-      ? [{ name: "Input", value: `||\`\`\`json\n${formatToolArguments(activeTrace.args)}\n\`\`\`||`, inline: false }]
-      : []),
-    ...(activeTrace.outputPreview
-      ? [{ name: "Output Preview", value: `||\`\`\`\n${activeTrace.outputPreview}\n\`\`\`||`, inline: false }]
-      : []),
     ...(activeTrace.error ? [{ name: "Error", value: activeTrace.error.slice(0, 1024), inline: false }] : []),
   );
 
