@@ -8,6 +8,8 @@ services:
     image: omp-discord-bot:latest
     container_name: omp-discord-bot
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     environment:
