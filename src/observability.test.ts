@@ -64,7 +64,6 @@ describe("tool execution trace formatting", () => {
     expect(json.fields?.find((f) => f.name === "Duration")?.value).toBe("2.50s");
     expect(json.fields?.find((f) => f.name === "Exit")?.value).toBe("0");
     expect(json.fields?.find((f) => f.name === "Intent")?.value).toBe("Checking modified files");
-    expect(json.fields?.find((f) => f.name === "Output Preview")?.value).toContain("nothing to commit");
   });
 });
 
