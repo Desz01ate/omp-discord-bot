@@ -22,7 +22,7 @@ import {
 } from "discord.js";
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
-import { SessionManager, type SessionContext, type OmpProcess } from "./session-manager";
+import { SessionManager, resolveOmpSessionPath, type SessionContext, type OmpProcess } from "./session-manager";
 import {
   buildDynamicThreadName,
   buildQuickActionRow,
@@ -551,6 +551,8 @@ function createOmpSession(
   cwd: string,
   initialModel?: string,
   metadata?: Record<string, unknown>,
+  sessionId?: string,
+  sessionFile?: string,
 ): SessionContext {
   let resolveInitialState: ((state: Record<string, unknown>) => void) | undefined;
   const initialStatePromise = new Promise<Record<string, unknown>>((resolve) => {
@@ -559,10 +561,13 @@ function createOmpSession(
   });
 
   const args = ["omp", "--mode", "rpc"];
+  const resumeTarget = resolveOmpSessionPath(sessionFile, sessionId);
+  if (resumeTarget) {
+    args.push(`--resume=${resumeTarget}`);
+  }
   if (initialModel) {
     args.push(`--model=${initialModel}`);
   }
-
   const proc = spawn(args, {
     cwd,
     env: getSanitizedChildEnv(),
@@ -591,6 +596,8 @@ function createOmpSession(
     process: proc,
     threadId: thread.id,
     cwd,
+    sessionId,
+    sessionFile: resumeTarget || sessionFile,
     ...(worktree ? { worktree } : {}),
     currentStreamBuffer: "",
     lastEditTimestamp: 0,
@@ -1197,11 +1204,25 @@ async function handleRpcEvent(
   // 7. Response frames (e.g. state / custom query results)
   if (type === "response" && event.command === "get_state" && event.data && typeof event.data === "object") {
     const data = event.data as Record<string, unknown>;
+    if (typeof data.sessionId === "string" && data.sessionId) {
+      session.sessionId = data.sessionId;
+    }
+    if (typeof data.sessionFile === "string" && data.sessionFile) {
+      session.sessionFile = data.sessionFile;
+    }
+    if (session.sessionId || session.sessionFile) {
+      void sessionManager.update(session.threadId, {
+        sessionId: session.sessionId,
+        sessionFile: session.sessionFile,
+      }).catch((err) => {
+        console.error(`Failed to update session binding info for thread ${session.threadId}:`, err);
+      });
+    }
+
     if (session.resolveInitialState) {
       session.resolveInitialState(data);
       session.resolveInitialState = undefined;
     }
-
     const gitSnapshot = await getGitSnapshot(session.cwd);
     const hud = mergeHudState(session, data);
     hud.branch = gitSnapshot.branch || undefined;

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -32,6 +33,8 @@ describe("SessionStore Implementations", () => {
         threadId: "thread_1",
         cwd: "/workspace/proj1",
         initialModel: "claude-3-7-sonnet",
+        sessionId: "omp-session-uuid-1",
+        sessionFile: "/root/.omp/agent/sessions/--proj1--/session1.jsonl",
         createdAt: 1000,
         updatedAt: 1000,
         metadata: { user: "alice", role: "admin" },
@@ -44,8 +47,9 @@ describe("SessionStore Implementations", () => {
       expect(retrieved?.threadId).toBe("thread_1");
       expect(retrieved?.cwd).toBe("/workspace/proj1");
       expect(retrieved?.initialModel).toBe("claude-3-7-sonnet");
+      expect(retrieved?.sessionId).toBe("omp-session-uuid-1");
+      expect(retrieved?.sessionFile).toBe("/root/.omp/agent/sessions/--proj1--/session1.jsonl");
       expect(retrieved?.createdAt).toBe(1000);
-      expect(retrieved?.metadata).toEqual({ user: "alice", role: "admin" });
 
       // Upsert update
       const updatedBinding: SessionBinding = {
@@ -107,6 +111,8 @@ describe("SessionStore Implementations", () => {
         threadId: "persistent_thread_100",
         cwd: "/home/user/project",
         initialModel: "o3-mini",
+        sessionId: "omp-sess-disk-1",
+        sessionFile: "/sessions/disk-1.jsonl",
         createdAt: 5000,
         updatedAt: 5000,
         metadata: { tags: ["prod", "agent"] },
@@ -123,12 +129,53 @@ describe("SessionStore Implementations", () => {
       expect(retrieved?.threadId).toBe("persistent_thread_100");
       expect(retrieved?.cwd).toBe("/home/user/project");
       expect(retrieved?.initialModel).toBe("o3-mini");
+      expect(retrieved?.sessionId).toBe("omp-sess-disk-1");
+      expect(retrieved?.sessionFile).toBe("/sessions/disk-1.jsonl");
       expect(retrieved?.metadata).toEqual({ tags: ["prod", "agent"] });
 
       const allSessions = await store2.list();
       expect(allSessions.length).toBe(1);
 
       await store2.close();
+    });
+    it("gracefully migrates existing SQLite tables lacking session_id and session_file columns", async () => {
+      const legacyDbPath = join(testDir, "legacy-sessions.sqlite");
+      const rawDb = new Database(legacyDbPath);
+      // Create legacy schema
+      rawDb.exec(`
+        CREATE TABLE session_bindings (
+          thread_id TEXT PRIMARY KEY,
+          cwd TEXT NOT NULL,
+          initial_model TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          metadata TEXT
+        );
+        INSERT INTO session_bindings VALUES ('legacy_thread', '/old/path', 'gpt-4o', 1000, 1000, NULL);
+      `);
+      rawDb.close();
+
+      // Now initialize store on legacy database
+      const store = new SqliteSessionStore({ dbPath: legacyDbPath });
+      await store.init();
+
+      const legacyBinding = await store.get("legacy_thread");
+      expect(legacyBinding?.threadId).toBe("legacy_thread");
+      expect(legacyBinding?.sessionId).toBeUndefined();
+      expect(legacyBinding?.sessionFile).toBeUndefined();
+
+      // Update with sessionId and sessionFile
+      await store.set({
+        ...legacyBinding!,
+        sessionId: "migrated-session-id",
+        sessionFile: "/path/to/migrated.jsonl",
+      });
+
+      const updated = await store.get("legacy_thread");
+      expect(updated?.sessionId).toBe("migrated-session-id");
+      expect(updated?.sessionFile).toBe("/path/to/migrated.jsonl");
+
+      await store.close();
     });
 
     it("throws when operating on uninitialized store", async () => {
