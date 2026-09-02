@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        EXTRA_APT_PACKAGES: ${EXTRA_APT_PACKAGES:-}
     image: omp-discord-bot:latest
     container_name: omp-discord-bot
     restart: unless-stopped
@@ -33,5 +35,9 @@ services:
       - ${PI_CONFIG_PATH:-~/.pi}:/root/.pi
       # OMX / Codex skills, prompts, and configurations
       - ${CODEX_CONFIG_PATH:-~/.codex}:/root/.codex:ro
+      # Mise tool data and runtime binary cache (Go, Java, .NET, Rust, etc.)
+      - ${HOST_MISE_DATA_PATH:-~/.cache/omp-discord-bot/mise}:/root/.local/share/mise
+      # (Optional) User startup hook scripts executed on container start
+      # - ${HOST_INIT_HOOKS_PATH:-./init.d}:/docker-entrypoint-init.d:ro
       # (Optional) Git config for author identity in OMP commits
       # - ${HOME}/.gitconfig:/root/.gitconfig:ro
