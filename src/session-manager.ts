@@ -31,7 +31,7 @@ export interface SessionContext {
   lastPrompt?: string;
   /** True while an extension confirmation is waiting for a Discord response. */
   confirmationPending?: boolean;
-  /** Prevents a trailing prompt_result from duplicating the agent_end action bar. */
+  /** Prevents a trailing prompt_result from duplicating the agent_end completion message. */
   completionBarAttached?: boolean;
   /** Pinned live dashboard message and its throttled update state. */
   hudMessage?: Message;

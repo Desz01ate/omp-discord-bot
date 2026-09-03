@@ -388,6 +388,7 @@ export async function handleMessageEditAsRewind(
     }
 
     await fullMessage.react("↩️").catch(() => {});
+
     const isPastTurn = cpIndex < checkpoints.length - 1;
     const statusMsg = await channel
       .send(

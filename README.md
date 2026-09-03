@@ -13,7 +13,6 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
   - `/model [selection]` — Real-time model switcher with context window indicators.
   - `/omp-new`, `/omp-terminate-all`, `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
 - **Interactive UI Approvals**: Confirmation requests (`extension_ui_request`) render as Discord **Action Buttons** (`Approve` / `Deny`) with timeout handling.
-- **Quick Action Bars & Reaction Shortcuts**: Completed turns expose `Undo`, `Compact`, `Abort`, and `Status` buttons. In managed threads, `🔄` requests undo while `🛑` or `❌` requests abort; all actions honor `ALLOWED_USERS`.
 - **Systemd User Service & Docker**: One-command daemonization via `./scripts/init.sh` or isolated containerized deployment with `docker compose`.
 
 ---

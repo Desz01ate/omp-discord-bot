@@ -1,41 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
   buildDynamicThreadName,
-  buildQuickActionRow,
   extractPromptTopic,
   isDefaultThreadName,
-  parseQuickActionId,
-  parseReactionShortcut,
   updateThreadStatusName,
 } from "./ui-helpers";
 
 describe("interactive UI helpers", () => {
-  it("builds and parses thread-scoped quick action IDs", () => {
-    const row = buildQuickActionRow("thread-123");
-    const buttons = row.components.map((component) => component.toJSON());
-    expect(buttons.map((button) => ("custom_id" in button ? button.custom_id : undefined))).toEqual([
-      "action_undo_thread-123",
-      "action_compact_thread-123",
-      "action_abort_thread-123",
-      "action_status_thread-123",
-    ]);
-    expect(parseQuickActionId("action_compact_thread-123")).toEqual({
-      action: "compact",
-      threadId: "thread-123",
-    });
-    expect(parseQuickActionId("action_unknown_thread-123")).toBeNull();
-    expect(parseQuickActionId("action_undo_")).toBeNull();
-  });
-
-  it("maps Unicode and named reaction values to shortcuts", () => {
-    expect(parseReactionShortcut("🛑")).toBe("abort");
-    expect(parseReactionShortcut("x")).toBe("abort");
-    expect(parseReactionShortcut("❌")).toBe("abort");
-    expect(parseReactionShortcut("🔄")).toBe("undo");
-    expect(parseReactionShortcut("arrows_counterclockwise")).toBe("undo");
-    expect(parseReactionShortcut("👍")).toBeNull();
-    expect(parseReactionShortcut(null)).toBeNull();
-  });
 
   it("extracts skill labels and readable topics", () => {
     expect(extractPromptTopic("$ralph Fix auth bug")).toEqual({
