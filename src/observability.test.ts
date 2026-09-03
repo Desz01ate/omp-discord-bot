@@ -8,7 +8,13 @@ import {
   type HudState,
   type ToolExecutionTrace,
 } from "./observability";
-
+import {
+  extractEventUsage,
+  mergeHudState,
+  readModelDisplay,
+  readTokenUsage,
+} from "./index";
+import type { SessionContext } from "./session-manager";
 describe("observability HUD formatting", () => {
   it("renders model, reasoning, token breakdown, context and git state", () => {
     const state: HudState = {
@@ -179,5 +185,147 @@ describe("multi-tool execution trace formatting (single message)", () => {
     expect(formatToolSummary({ id: "2", toolName: "bash", phase: "completed", startedAt: 0, args: { command: "git diff" } })).toBe("git diff");
     expect(formatToolSummary({ id: "3", toolName: "read", phase: "completed", startedAt: 0, args: { path: "src/app.ts" } })).toBe("src/app.ts");
     expect(formatToolSummary({ id: "4", toolName: "grep", phase: "completed", startedAt: 0, args: { pattern: "foo.*bar" } })).toBe("pattern: foo.*bar");
+  });
+});
+
+describe("model display formatting", () => {
+  it("formats string model correctly", () => {
+    expect(readModelDisplay({ model: "openai/gpt-5.6-luna" })).toBe("openai/gpt-5.6-luna");
+  });
+
+  it("formats provider, id, and name when id and name differ", () => {
+    expect(
+      readModelDisplay({
+        model: {
+          id: "openai/gpt-5.6-luna",
+          name: "GPT-5.6 Luna",
+          provider: "litellm",
+        },
+      }),
+    ).toBe("litellm/openai/gpt-5.6-luna (GPT-5.6 Luna)");
+  });
+
+  it("avoids repeating name when id equals name", () => {
+    expect(
+      readModelDisplay({
+        model: {
+          id: "antigravity/gemini-3.8-flash-high",
+          name: "antigravity/gemini-3.8-flash-high",
+          provider: "litellm",
+        },
+      }),
+    ).toBe("litellm/antigravity/gemini-3.8-flash-high");
+  });
+
+  it("handles model object passed directly as root data", () => {
+    expect(
+      readModelDisplay({
+        id: "gpt-4o",
+        name: "GPT-4o",
+        provider: "openai",
+      }),
+    ).toBe("openai/gpt-4o (GPT-4o)");
+  });
+});
+
+describe("event usage extraction", () => {
+  it("extracts usage from turn_end message.usage", () => {
+    const event = {
+      type: "turn_end",
+      message: {
+        role: "assistant",
+        usage: {
+          input: 5952,
+          output: 42,
+          cacheRead: 20417,
+          totalTokens: 26411,
+        },
+      },
+    };
+    expect(extractEventUsage(event)).toEqual({
+      input: 5952,
+      output: 42,
+      total: 26411,
+    });
+  });
+
+  it("extracts usage from agent_end messages array", () => {
+    const event = {
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "test" },
+        {
+          role: "assistant",
+          usage: {
+            input: 8100,
+            output: 250,
+            totalTokens: 8350,
+          },
+        },
+      ],
+    };
+    expect(extractEventUsage(event)).toEqual({
+      input: 8100,
+      output: 250,
+      total: 8350,
+    });
+  });
+
+  it("returns undefined when no usage is present", () => {
+    expect(extractEventUsage({ type: "turn_end" })).toBeUndefined();
+  });
+});
+
+describe("HUD state merging and token persistence", () => {
+  function createFakeSession(): SessionContext {
+    return {
+      process: {} as unknown as SessionContext["process"],
+      threadId: "t1",
+      cwd: "/workspace",
+      currentStreamBuffer: "",
+      lastEditTimestamp: 0,
+      cumulativeTokens: { input: 15000, output: 850 },
+      activeSubagentsMap: new Map([["sub1", { id: "sub1", agent: "scout" }]]),
+      hudState: {
+        model: "openai/gpt-5.2",
+        reasoningLevel: "low",
+        tokens: {
+          input: 15000,
+          output: 850,
+          total: 15850,
+          contextWindow: 200000,
+          contextPercent: 7.9,
+        },
+        activeSubagents: ["scout"],
+        cwd: "/workspace",
+      },
+    };
+  }
+
+  it("preserves cumulative tokens when get_state returns only contextUsage", () => {
+    const session = createFakeSession();
+    const getStateData = {
+      contextUsage: {
+        tokens: 34200,
+        contextWindow: 1048576,
+        percent: 3.26,
+      },
+      model: {
+        id: "openai/gpt-5.6-luna",
+        name: "GPT-5.6 Luna",
+        provider: "litellm",
+      },
+      thinkingLevel: "high",
+    };
+
+    const merged = mergeHudState(session, getStateData);
+    expect(merged.tokens?.input).toBe(15000);
+    expect(merged.tokens?.output).toBe(850);
+    expect(merged.tokens?.total).toBe(34200);
+    expect(merged.tokens?.contextWindow).toBe(1048576);
+    expect(merged.tokens?.contextPercent).toBe(3.26);
+    expect(merged.model).toBe("litellm/openai/gpt-5.6-luna (GPT-5.6 Luna)");
+    expect(merged.reasoningLevel).toBe("high");
+    expect(merged.activeSubagents).toEqual(["scout"]);
   });
 });
