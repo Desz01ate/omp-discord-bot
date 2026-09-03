@@ -71,6 +71,13 @@ import {
   type HudState,
   type ToolExecutionTrace,
 } from "./observability";
+import {
+  type OmpModelMeta,
+  getCanonicalModelSelector,
+  getModelSuggestions,
+  isKnownModel,
+  resolveModelSelector,
+} from "./models";
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -112,12 +119,6 @@ interface OmpCommandMeta {
   source?: string;
 }
 
-interface OmpModelMeta {
-  id: string;
-  name?: string;
-  provider?: string;
-  contextWindow?: number;
-}
 
 // Global cached metadata from OMP
 let cachedCommands: OmpCommandMeta[] = [];
@@ -533,8 +534,9 @@ function createOmpSession(
   if (resumeTarget) {
     args.push(`--resume=${ resumeTarget }`);
   }
-  if (initialModel) {
-    args.push(`--model=${ initialModel }`);
+  const resolvedModel = initialModel ? (resolveModelSelector(initialModel, cachedModels) || initialModel) : undefined;
+  if (resolvedModel) {
+    args.push(`--model=${ resolvedModel }`);
   }
   const proc = spawn(args, {
     cwd,
@@ -574,7 +576,7 @@ function createOmpSession(
     lastEditTimestamp: 0,
     initialStatePromise,
     resolveInitialState,
-    hudState: { model: initialModel, cwd, turnStatus: "idle", updatedAt: Date.now() },
+    hudState: { model: resolvedModel || initialModel, cwd, turnStatus: "idle", updatedAt: Date.now() },
     hudLastEditTimestamp: 0,
     toolTraces: new Map(),
     toolTraceHistory: [],
@@ -1368,10 +1370,16 @@ async function handleRpcEvent(
     if (typeof data.sessionFile === "string" && data.sessionFile) {
       session.sessionFile = data.sessionFile;
     }
-    if (session.sessionId || session.sessionFile) {
+    const modelObj = data.model as { id?: string; provider?: string } | undefined;
+    const currentModelSelector = modelObj?.id
+      ? getCanonicalModelSelector({ id: modelObj.id, provider: modelObj.provider })
+      : undefined;
+
+    if (session.sessionId || session.sessionFile || currentModelSelector) {
       void sessionManager.update(session.threadId, {
-        sessionId: session.sessionId,
-        sessionFile: session.sessionFile,
+        ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+        ...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
+        ...(currentModelSelector ? { initialModel: currentModelSelector } : {}),
       }).catch((err) => {
         console.error(`Failed to update session binding info for thread ${ session.threadId }:`, err);
       });
@@ -1621,16 +1629,6 @@ async function handleRpcEvent(
   }
 }
 
-function getModelSuggestions(queryRaw: string): Array<{ name: string; value: string }> {
-  const query = queryRaw.toLowerCase();
-  return cachedModels
-    .filter((m) => m.id.toLowerCase().includes(query) || (m.name && m.name.toLowerCase().includes(query)))
-    .slice(0, 25)
-    .map((m) => ({
-      name: `${ m.name || m.id } [${ m.provider || "omp" }] (${ Math.round((m.contextWindow || 0) / 1000) }k ctx)`.slice(0, 100),
-      value: m.id,
-    }));
-}
 
 function getDirectorySuggestions(input: string): Array<{ name: string; value: string }> {
   const rootDir = process.env.WORKSPACE_ROOT || process.env.DEFAULT_WORKSPACE_DIR || process.cwd();
@@ -1731,7 +1729,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
       return;
     }
     if (focused.name === "model" || focused.name === "selection") {
-      const filtered = getModelSuggestions(focused.value);
+      const filtered = getModelSuggestions(focused.value, cachedModels);
       await interaction.respond(filtered);
       return;
     }
@@ -1784,7 +1782,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction): Promise
 
   // Model autocomplete
   if (interaction.commandName === "model" && focused.name === "selection") {
-    const filtered = getModelSuggestions(focused.value);
+    const filtered = getModelSuggestions(focused.value, cachedModels);
     await interaction.respond(filtered);
     return;
   }
@@ -1855,6 +1853,14 @@ client.on("interactionCreate", async (interaction) => {
       });
       return;
     }
+    if (inputModel && cachedModels.length > 0 && !isKnownModel(inputModel, cachedModels)) {
+      await interaction.reply({
+        content: `❌ Unknown model \`${ inputModel }\`. Please select an available model from the autocomplete suggestions or check \`/model\`.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const resolvedModel = inputModel ? resolveModelSelector(inputModel, cachedModels) : undefined;
     const sessionId = Math.random().toString(36).slice(2, 8);
     const threadName = `omp-session-${ sessionId }`;
     await interaction.deferReply();
@@ -1897,11 +1903,11 @@ client.on("interactionCreate", async (interaction) => {
       const session = createOmpSession(
         thread,
         sessionCwd,
-        inputModel || undefined,
+        resolvedModel,
         createdWorktree ? { worktree: createdWorktree } : undefined,
       );
       await sessionManager.register(session, {
-        initialModel: inputModel || undefined,
+        initialModel: resolvedModel,
         metadata: {
           guildId: thread.guildId,
           parentChannelId: thread.parentId,
@@ -1917,9 +1923,7 @@ client.on("interactionCreate", async (interaction) => {
       ]);
 
       const modelData = (state?.model as { id?: string; name?: string; provider?: string } | undefined) || {};
-      const modelDisplay = modelData.id
-        ? `${modelData.provider ? `${ modelData.provider }/` : ""}${ modelData.id }${modelData.name ? ` (${ modelData.name })` : ""}`
-        : (inputModel || "default");
+      const modelDisplay = readModelDisplay(state || {}) || resolvedModel || inputModel || "default";
 
       const thinkingLevel = typeof state?.thinkingLevel === "string" ? state.thinkingLevel : "normal";
       const fastMode = Boolean(state?.fastModeActive);
@@ -2122,8 +2126,9 @@ client.on("interactionCreate", async (interaction) => {
 
   // /model [selection]
   if (interaction.commandName === "model") {
-    const selection = interaction.options.getString("selection");
-    if (selection) {
+    const rawSelection = interaction.options.getString("selection");
+    if (rawSelection) {
+      const selection = resolveModelSelector(rawSelection, cachedModels);
       await interaction.reply(`🔄 Switching model to \`${ selection }\`...`);
       session.hudState = {
         ...(session.hudState || { cwd: session.cwd }),
@@ -2131,6 +2136,7 @@ client.on("interactionCreate", async (interaction) => {
         updatedAt: Date.now(),
       } as unknown as Record<string, unknown>;
       scheduleHudUpdate(session);
+      void sessionManager.update(session.threadId, { initialModel: selection });
       sendRpc(session, {
         id: `model_${ Date.now() }`,
         type: "prompt",
