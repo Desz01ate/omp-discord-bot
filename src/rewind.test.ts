@@ -499,18 +499,22 @@ describe("handleMessageEditAsRewind Orchestration", () => {
       },
     };
 
+    let reactedEmoji = "";
     const editedMessage = {
       id: "msg_2",
       author: { bot: false, id: "user_1" },
       channel: thread,
       content: "Prompt 2 Edited!",
       attachments: new Map(),
-      react: async () => {},
+      react: async (emoji: string) => {
+        reactedEmoji = emoji;
+      },
     } as unknown as Message;
 
     const result = await handleMessageEditAsRewind(editedMessage, editedMessage, context);
     expect(result).toBe(true);
 
+    expect(reactedEmoji).toBe("↩️");
     // Verify session branched
     const branchCmd = sentRpcCommands.find((c) => c.type === "branch");
     expect(branchCmd).toBeDefined();
