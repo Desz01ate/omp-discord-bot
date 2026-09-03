@@ -45,7 +45,7 @@ COPY tsconfig.json ./
 COPY src/ ./src/
 
 # Default workspace directory for bind-mounting host repositories
-RUN mkdir -p /workspace
+RUN mkdir -p /app/data /workspace
 
 ENV WORKSPACE_ROOT=/workspace \
     NODE_ENV=production

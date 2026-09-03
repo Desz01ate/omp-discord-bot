@@ -18,6 +18,9 @@ services:
       - ALLOWED_USERS=${ALLOWED_USERS:-}
       - CREATE_PRIVATE_THREADS=${CREATE_PRIVATE_THREADS:-true}
       - WORKSPACE_ROOT=/workspace
+      # Session Storage Configuration
+      - SESSION_STORAGE_TYPE=${SESSION_STORAGE_TYPE:-sqlite}
+      - SQLITE_DB_PATH=${SQLITE_DB_PATH:-/app/data/sessions.sqlite}
       # LLM Provider & Gateway URLs / Keys
       - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -31,6 +34,8 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_USER_ID=${TELEGRAM_USER_ID:-}
     volumes:
+      # Bot persistent storage: SQLite session database and bot state
+      - ${HOST_DATA_PATH:-./data}:/app/data
       # Host workspace: Bind mounts host repositories to /workspace inside container
       - ${HOST_WORKSPACE_PATH:-./workspace}:/workspace
       # OMP & Pi agent configurations (auth, models, history, roles)
