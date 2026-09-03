@@ -1,4 +1,4 @@
-# OMP Discord Bot
+# OMP Discord Bridge
 
 An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete session lifecycle management, live streaming, real-time command/skill execution, and interactive approvals directly inside Discord.
 
@@ -31,7 +31,7 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 
 1. **Clone / Navigate to Project Directory**:
    ```bash
-   cd ~/Projects/omp-discord-bot
+   cd ~/Projects/omp-discord-bridge
    ```
 
 2. **Configure Environment Variables**:
@@ -96,7 +96,7 @@ You do not need to fork or edit the `Dockerfile` to add compilers and SDKs:
    dotnet = "8.0"
    rust = "latest"
    ```
-   Toolchain binaries are persistently cached on the host at `HOST_MISE_DATA_PATH` (defaults to `~/.cache/omp-discord-bot/mise`).
+   Toolchain binaries are persistently cached on the host at `HOST_MISE_DATA_PATH` (defaults to `~/.cache/omp-discord-bridge/mise`).
 
 2. **System Packages via `.env`**:
    Specify extra Debian packages to bake in during `docker compose build`:
@@ -169,7 +169,7 @@ Inside any thread created by `/omp-new`:
 ## Project Structure
 
 ```text
-omp-discord-bot/
+omp-discord-bridge/
 ├── package.json          # Dependencies and scripts
 ├── tsconfig.json         # TypeScript compiler configuration
 ├── Dockerfile            # Container image definition with Bun, OMP, and dev tools
