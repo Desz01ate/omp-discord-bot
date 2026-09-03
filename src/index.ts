@@ -57,6 +57,12 @@ import {
   type WorktreeInfo,
 } from "./workspace";
 import {
+  UPLOAD_ARTIFACT_TOOL_DEFINITION,
+  handleHostToolCancel,
+  handleUploadArtifactCall,
+  sendHostToolResult,
+} from "./artifact-host-tool";
+import {
   extractEventUsage,
   formatHudEmbed,
   formatToolExecutionEmbed,
@@ -589,6 +595,7 @@ function createOmpSession(
     checkpoints: restoredCheckpoints,
     pendingRpcRequests: new Map(),
     cumulativeTokens: { input: 0, output: 0 },
+    pendingHostToolCalls: new Map(),
     activeSubagentsMap: new Map(),
     rpcDecoder: new RpcFrameDecoder(),
   };
@@ -639,6 +646,13 @@ function createOmpSession(
         req.reject(new Error(`OMP process exited with code ${ code }`));
       }
       session.pendingRpcRequests.clear();
+    }
+    if (session.pendingHostToolCalls) {
+      for (const [, call] of session.pendingHostToolCalls) {
+        call.abortController.abort(new Error(`OMP process exited with code ${ code }`));
+        call.reject(new Error("OMP process exited before host tool completed"));
+      }
+      session.pendingHostToolCalls.clear();
     }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
@@ -745,6 +759,9 @@ function formatToolStatus(toolName: string, rawArgs?: unknown, rawIntent?: unkno
 
   if (toolName === "lsp" && typeof args.action === "string") {
     return `🧠 \`lsp\`: *${ args.action }*`;
+  }
+  if (toolName === "upload_artifact" && typeof args.path === "string") {
+    return `📎 \`upload_artifact\`: \`${ args.path }\``;
   }
 
   return `🔧 *Running \`${ toolName }\`...*`;
@@ -1100,6 +1117,11 @@ async function handleRpcEvent(
       id: "init_state",
       type: "get_state",
     });
+    sendRpc(session, {
+      id: "init_host_tools",
+      type: "set_host_tools",
+      tools: [UPLOAD_ARTIFACT_TOOL_DEFINITION],
+    });
     return;
   }
 
@@ -1158,6 +1180,31 @@ async function handleRpcEvent(
     return;
   }
   // 4. Tool Execution Events
+  // 4. Host Tool Invocations and Cancellations
+  if (type === "host_tool_call") {
+    const id = typeof event.id === "string" ? event.id : "";
+    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : id;
+    const toolName = typeof event.toolName === "string" ? event.toolName : "";
+    const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
+    if (!id || !toolName) {
+      return;
+    }
+    if (toolName === "upload_artifact") {
+      void handleUploadArtifactCall(session, thread, { id, toolCallId, toolName, arguments: args }, sendRpc);
+    } else {
+      sendHostToolResult(session, id, `Host tool "${ toolName }" is not registered`, {}, true, sendRpc);
+    }
+    return;
+  }
+
+  if (type === "host_tool_cancel") {
+    const targetId = typeof event.targetId === "string" ? event.targetId : "";
+    if (targetId) {
+      handleHostToolCancel(session, targetId);
+    }
+    return;
+  }
+
   if (type === "tool_execution_start") {
     await handleToolExecutionStart(session, thread, event);
     return;
