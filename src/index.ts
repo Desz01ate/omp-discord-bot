@@ -124,6 +124,7 @@ let cachedCommands: OmpCommandMeta[] = [];
 let cachedModels: OmpModelMeta[] = [];
 const sessionManager = new SessionManager();
 await sessionManager.init();
+let isShuttingDown = false;
 // Helper: send RPC command
 function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
   const line = JSON.stringify(command) + "\n";
@@ -623,14 +624,53 @@ function createOmpSession(
     session.toolTraces?.clear();
     session.toolTraceHistory = [];
     session.activePromptMsg = undefined;
-    void thread.send(`⚠️ OMP process exited (code ${ code }).`).catch(() => {});
-    void sessionManager.terminate(session, undefined, false);
+    if (!isShuttingDown) {
+      void thread.send(`⚠️ OMP process exited (code ${ code }).`).catch(() => {});
+    }
+    sessionManager.deactivate(session);
   });
   return session;
 }
 
 async function terminateSession(session: SessionContext, deleteThread = true): Promise<void> {
   await sessionManager.terminate(session, client, deleteThread);
+}
+async function getOrRestoreSession(channelId: string): Promise<SessionContext | undefined> {
+  const existing = sessionManager.get(channelId);
+  if (existing) {
+    return existing;
+  }
+  const binding = await sessionManager.getBinding(channelId).catch(() => null);
+  if (!binding) {
+    return undefined;
+  }
+  if (!existsSync(binding.cwd)) {
+    console.warn(`Cannot restore session for thread ${ channelId }: CWD no longer exists (${ binding.cwd })`);
+    return undefined;
+  }
+  const channel =
+    client.channels.cache.get(channelId) ??
+    (await client.channels.fetch(channelId).catch(() => null));
+  if (!channel || !channel.isThread() || channel.archived || channel.locked) {
+    return undefined;
+  }
+  const session = createOmpSession(
+    channel,
+    binding.cwd,
+    binding.initialModel,
+    binding.metadata,
+    binding.sessionId,
+    binding.sessionFile,
+  );
+  if (binding.sessionId && !session.sessionId) {
+    session.sessionId = binding.sessionId;
+  }
+  if (binding.sessionFile && !session.sessionFile) {
+    session.sessionFile = binding.sessionFile;
+  }
+  sessionManager.registerActive(session);
+  console.log(`🔄 Re-spawned OMP session for thread ${ channel.id } ("${ channel.name }") on activity.`);
+  return session;
 }
 
 async function updateThreadNameFromPrompt(thread: ThreadChannel, prompt: string): Promise<void> {
@@ -1947,7 +1987,7 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // Session-bound Slash Commands
-  const session = sessionManager.get(interaction.channelId);
+  const session = await getOrRestoreSession(interaction.channelId);
   if (!session) {
     await interaction.reply({
       content: "⚠️ This command must be executed inside an active OMP thread created by `/omp-new`.",
@@ -2322,7 +2362,7 @@ client.on("messageCreate", async (message) => {
   if (!isUserAllowed(message.author.id)) {
     return;
   }
-  const session = sessionManager.get(message.channelId);
+  const session = await getOrRestoreSession(message.channelId);
   if (!session) {
     return;
   }
@@ -2386,3 +2426,37 @@ client.on(Events.ClientReady, async () => {
 });
 
 client.login(DISCORD_TOKEN);
+
+async function handleShutdown(signal: string): Promise<void> {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
+  console.log(`\n🛑 Received ${ signal }. Shutting down gracefully...`);
+
+  for (const session of sessionManager.getActiveSessions()) {
+    sessionManager.deactivate(session);
+    try {
+      session.process.kill();
+    } catch {
+      // Process might already be dead
+    }
+  }
+
+  try {
+    await sessionManager.close();
+  } catch (err) {
+    console.error("Error closing session manager:", err);
+  }
+
+  try {
+    await client.destroy();
+  } catch (err) {
+    console.error("Error destroying Discord client:", err);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => void handleShutdown("SIGTERM"));
+process.on("SIGINT", () => void handleShutdown("SIGINT"));

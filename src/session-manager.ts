@@ -215,6 +215,67 @@ export class SessionManager {
     };
     await this.store.set(binding);
   }
+  /**
+   * Registers a spawned session context in memory only without overwriting its store record.
+   * Typically used during startup restoration or on-demand session reactivation.
+   */
+  public registerActive(session: SessionContext): void {
+    this.activeSessions.set(session.threadId, session);
+  }
+
+  /**
+   * Retrieves a persistent session binding from storage if present.
+   */
+  public async getBinding(threadId: string): Promise<SessionBinding | null> {
+    return this.store.get(threadId);
+  }
+
+  /**
+   * Checks whether a persistent binding exists in storage.
+   */
+  public async hasBinding(threadId: string): Promise<boolean> {
+    const binding = await this.store.get(threadId).catch(() => null);
+    return binding !== null;
+  }
+
+  /**
+   * Deactivates an active session in-memory (e.g. when its process exits or during shutdown),
+   * stopping timers/typing and rejecting pending requests while PRESERVING persistent storage,
+   * session files, worktrees, and thread channel for future resumption.
+   */
+  public deactivate(sessionOrThreadId: SessionContext | string): void {
+    const threadId = typeof sessionOrThreadId === "string" ? sessionOrThreadId : sessionOrThreadId.threadId;
+    const session = typeof sessionOrThreadId === "string" ? this.activeSessions.get(threadId) : sessionOrThreadId;
+
+    if (session) {
+      stopTyping(session);
+      if (session.editTimer) {
+        clearTimeout(session.editTimer);
+        session.editTimer = undefined;
+      }
+      if (session.hudUpdateTimer) {
+        clearTimeout(session.hudUpdateTimer);
+        session.hudUpdateTimer = undefined;
+      }
+      session.toolTraces?.clear();
+      session.toolTraceHistory = [];
+      if (session.pendingRpcRequests) {
+        for (const [, req] of session.pendingRpcRequests) {
+          clearTimeout(req.timer);
+          req.reject(new Error("Session deactivated"));
+        }
+        session.pendingRpcRequests.clear();
+      }
+      session.checkpoints = [];
+      try {
+        session.process.kill();
+      } catch {
+        // Subprocess might already be dead
+      }
+    }
+
+    this.activeSessions.delete(threadId);
+  }
 
   /**
    * Updates mutable fields on an active session and persists changes to storage.

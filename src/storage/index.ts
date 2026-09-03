@@ -1,3 +1,4 @@
+import { existsSync } from "fs";
 import type { SessionStore } from "./types";
 import { SqliteSessionStore, type SqliteSessionStoreOptions } from "./sqlite";
 import { InMemorySessionStore } from "./memory";
@@ -24,7 +25,7 @@ export function createSessionStore(options: SessionStoreFactoryOptions = {}): Se
     case "sqlite":
     default:
       return new SqliteSessionStore({
-        dbPath: options.dbPath || process.env.SQLITE_DB_PATH || "sessions.sqlite",
+        dbPath: options.dbPath || process.env.SQLITE_DB_PATH || (existsSync("sessions.sqlite") ? "sessions.sqlite" : "data/sessions.sqlite"),
         db: options.db,
       });
   }

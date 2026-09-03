@@ -300,6 +300,38 @@ describe("Session Termination and Persistence", () => {
     await store2.close();
   });
 
+  it("preserves persistent binding when OMP subprocess exits so it can be restored on restart", async () => {
+    const dbPath = join(testDir, "proc-exit-survival.sqlite");
+    const store1 = new SqliteSessionStore({ dbPath });
+    await store1.init();
+
+    const projectDir = join(testDir, "proj-survive");
+    mkdirSync(projectDir, { recursive: true });
+
+    await store1.set({
+      threadId: "survive_thread",
+      cwd: projectDir,
+      initialModel: "gpt-5.5",
+      sessionId: "survive-uuid",
+      sessionFile: join(projectDir, "sess.jsonl"),
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
+    // When proc.exited fires, deactivate is called (not terminate), so store binding is NOT deleted
+    expect(await store1.get("survive_thread")).not.toBeNull();
+    await store1.close();
+
+    // On subsequent bot restart, store2 reopens and recovers the binding
+    const store2 = new SqliteSessionStore({ dbPath });
+    await store2.init();
+    const restored = await store2.get("survive_thread");
+    expect(restored).not.toBeNull();
+    expect(restored?.sessionId).toBe("survive-uuid");
+    expect(restored?.initialModel).toBe("gpt-5.5");
+    await store2.close();
+  });
+
   it("handles empty sessions gracefully", async () => {
     const sessionsMap = new Map<string, MockSession>();
     const active = Array.from(sessionsMap.values());

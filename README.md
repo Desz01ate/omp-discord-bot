@@ -61,11 +61,13 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
 
 Docker runs the bot and OMP in an isolated container with your code repositories bind-mounted from the host into `/workspace`.
 
-1. In `.env`, specify the host repository directory to mount:
+1. In `.env`, specify the host repository directory and storage path to mount:
    ```ini
    HOST_WORKSPACE_PATH=/path/to/your/projects
    OMP_CONFIG_PATH=~/.omp
+   HOST_DATA_PATH=./data
    ```
+   Thread session bindings in SQLite are persistently stored on the host at `HOST_DATA_PATH` (defaults to `./data/sessions.sqlite`), surviving container rebuilds and `--force-recreate`.
 
 2. Build and start with Docker Compose:
    ```bash

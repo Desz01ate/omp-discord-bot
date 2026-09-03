@@ -428,4 +428,87 @@ describe("SessionManager Composite Service", () => {
 
     await manager.close();
   });
+
+  it("deactivates an active session in-memory while preserving persistent store binding and files", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const { session, processKilled } = createMockSessionContext("t_deact");
+    const sessFile = join(testDir, "deact_session.jsonl");
+    writeFileSync(sessFile, '{ "type":"session","id":"deact_uuid" }\n');
+    session.sessionFile = sessFile;
+    session.sessionId = "deact_uuid";
+
+    // Create attachment file
+    const attDir = join(testDir, ".discord-attachments", "t_deact");
+    mkdirSync(attDir, { recursive: true });
+    const photoPath = join(attDir, "photo.jpg");
+    writeFileSync(photoPath, "fake photo");
+
+    // Setup pending RPC request and timer
+    let rpcRejected = false;
+    let rpcError: Error | undefined;
+    session.pendingRpcRequests = new Map([
+      [
+        "req_1",
+        {
+          command: "test_cmd",
+          timer: { hasRef: () => false } as unknown as Timer,
+          resolve: () => {},
+          reject: (err: unknown) => {
+            rpcRejected = true;
+            rpcError = err instanceof Error ? err : new Error(String(err));
+          },
+        },
+      ],
+    ]);
+
+    await manager.register(session);
+    expect(manager.has("t_deact")).toBe(true);
+    expect(await manager.hasBinding("t_deact")).toBe(true);
+
+    manager.deactivate(session);
+
+    // In-memory session should be deactivated
+    expect(manager.has("t_deact")).toBe(false);
+    expect(session.editTimer).toBeUndefined();
+    expect(processKilled.value).toBe(true);
+    expect(rpcRejected).toBe(true);
+    expect(rpcError?.message).toBe("Session deactivated");
+
+    // Persistent store binding and disk files must remain intact
+    const binding = await manager.getBinding("t_deact");
+    expect(binding).not.toBeNull();
+    expect(binding?.threadId).toBe("t_deact");
+    expect(binding?.sessionId).toBe("deact_uuid");
+    expect(binding?.sessionFile).toBe(sessFile);
+    expect(existsSync(sessFile)).toBe(true);
+    expect(existsSync(photoPath)).toBe(true);
+
+    await manager.close();
+  });
+
+  it("registers active session in-memory only via registerActive without overwriting store", async () => {
+    const store = new SqliteSessionStore({ dbPath: ":memory:" });
+    const manager = new SessionManager({ store });
+    await manager.init();
+
+    const { session } = createMockSessionContext("t_reg_active");
+    await manager.register(session);
+    const originalBinding = await manager.getBinding("t_reg_active");
+    expect(originalBinding).not.toBeNull();
+
+    manager.deactivate(session);
+    expect(manager.has("t_reg_active")).toBe(false);
+
+    const { session: resurrected } = createMockSessionContext("t_reg_active");
+    manager.registerActive(resurrected);
+
+    expect(manager.has("t_reg_active")).toBe(true);
+    const bindingAfter = await manager.getBinding("t_reg_active");
+    expect(bindingAfter?.createdAt).toBe(originalBinding?.createdAt);
+
+    await manager.close();
+  });
 });

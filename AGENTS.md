@@ -100,8 +100,8 @@ journalctl --user -u omp-discord-bot.service -f
 - The `SessionManager` composite service encapsulates both the hot in-memory process table (`Map<string, SessionContext>`) and cold persistence layer (`SessionStore`), ensuring atomic lifecycle synchronization.
 - Thread-to-session bindings (`threadId`, `cwd`, `initialModel`, timestamps, metadata) are persisted via a swappable `SessionStore` interface (backed by SQLite via `bun:sqlite` by default).
 - On bot startup / restart (`Events.ClientReady`), `sessionManager.restoreAll()` automatically recovers active threads and re-spawns OMP RPC subprocesses; stale or deleted threads are pruned automatically.
-- When an `omp` subprocess exits (`proc.exited`) or is terminated, `SessionManager` removes the binding from both the active process map and persistent store.
-- When a Discord thread is deleted (`Events.ThreadDelete`), `sessionManager.terminate()` kills the subprocess, cleans attachments, and purges the persistent binding.
+- When an `omp` subprocess exits (`proc.exited`) or the bot shuts down, `sessionManager.deactivate()` releases in-memory timers and process references while preserving persistent storage bindings across restarts and allowing on-demand resumption.
+- When a session is explicitly terminated (`/omp-terminate`, `/omp-terminate-all`) or a Discord thread is deleted (`Events.ThreadDelete`), `sessionManager.terminate()` kills the subprocess, cleans attachments, removes worktrees, and purges the persistent binding.
 ### 2. OMP RPC Lifecycle & Protocol Negotiation
 - Subprocesses are spawned as `spawn(["omp", "--mode", "rpc"], { cwd, stdin: "pipe", stdout: "pipe", stderr: "inherit" })`.
 - On receiving the `ready` frame from OMP stdout, the bot immediately negotiates protocol:
