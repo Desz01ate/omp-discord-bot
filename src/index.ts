@@ -22,6 +22,7 @@ import {
 import { spawn, type Subprocess } from "bun";
 import { createInterface } from "readline";
 import { SessionManager, resolveOmpSessionPath, type SessionContext, type OmpProcess } from "./session-manager";
+import { RpcFrameDecoder } from "./rpc-decoder";
 import {
   handleMessageEditAsRewind,
   recordUserTurnCheckpoint,
@@ -128,6 +129,9 @@ await sessionManager.init();
 let isShuttingDown = false;
 // Helper: send RPC command
 function sendRpc(session: SessionContext, command: Record<string, unknown>): void {
+  const type = typeof command.type === "string" ? command.type : "unknown";
+  const id = typeof command.id === "string" ? command.id : undefined;
+  console.log(`[RPC:${ session.threadId }] > Sent: ${ type }${ id ? ` (id: ${ id })` : "" }`);
   const line = JSON.stringify(command) + "\n";
   session.process.stdin.write(line);
   session.process.stdin.flush();
@@ -281,6 +285,7 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
 
   const nodeStdout = Readable.fromWeb(proc.stdout as unknown as WebReadableStream);
   const readline = createInterface({ input: nodeStdout, terminal: false });
+  const rpcDecoder = new RpcFrameDecoder();
 
   let fetchedCommands: OmpCommandMeta[] = [];
   let fetchedModels: OmpModelMeta[] = [];
@@ -293,11 +298,12 @@ async function fetchOmpMetadata(): Promise<{ commands: OmpCommandMeta[]; models:
         return;
       }
       try {
-        const frame: unknown = JSON.parse(line);
-        if (!frame || typeof frame !== "object") {
+        const rawFrame: unknown = JSON.parse(line);
+        const decodedFrame = rpcDecoder.push(rawFrame);
+        if (!decodedFrame) {
           return;
         }
-        const obj = frame as Record<string, unknown>;
+        const obj = decodedFrame;
 
         if (obj.type === "ready") {
           proc.stdin.write(JSON.stringify({ id: "cmd_req", type: "get_available_commands" }) + "\n");
@@ -584,6 +590,7 @@ function createOmpSession(
     pendingRpcRequests: new Map(),
     cumulativeTokens: { input: 0, output: 0 },
     activeSubagentsMap: new Map(),
+    rpcDecoder: new RpcFrameDecoder(),
   };
   void ensurePinnedHud(session, thread);
 
@@ -598,12 +605,24 @@ function createOmpSession(
       return;
     }
     try {
-      const event: unknown = JSON.parse(line);
-      if (event && typeof event === "object") {
-        void handleRpcEvent(session, thread, event as Record<string, unknown>);
+      const rawEvent: unknown = JSON.parse(line);
+      const event = session.rpcDecoder ? session.rpcDecoder.push(rawEvent) : (rawEvent && typeof rawEvent === "object" ? rawEvent as Record<string, unknown> : undefined);
+      if (!event || typeof event !== "object") {
+        return;
       }
+      const evt = event as Record<string, unknown>;
+      const type = typeof evt.type === "string" ? evt.type : "unknown";
+      if (type !== "message_update") {
+        const detail = typeof evt.toolName === "string"
+          ? ` [tool: ${ evt.toolName }]`
+          : typeof evt.method === "string"
+            ? ` [method: ${ evt.method }, id: ${ String(evt.id || "") }]`
+            : "";
+        console.log(`[RPC:${ thread.id }] < Recv: ${ type }${ detail }`);
+      }
+      void handleRpcEvent(session, thread, evt);
     } catch (err) {
-      console.error("RPC parse error:", err);
+      console.error(`[RPC:${ thread.id }] Parse error:`, err, line.slice(0, 150));
     }
   });
   proc.exited.then((code: number | null) => {
@@ -623,6 +642,7 @@ function createOmpSession(
     }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
+    session.rpcDecoder?.reset();
     session.toolTraces?.clear();
     session.toolTraceHistory = [];
     session.activePromptMsg = undefined;
@@ -855,6 +875,7 @@ function startTyping(session: SessionContext, thread: ThreadChannel): void {
     clearInterval(session.typingTimer);
     session.typingTimer = undefined;
   }
+  console.log(`[Typing:${ thread.id }] Started typing loop`);
   void thread.sendTyping().catch(() => {});
   session.typingTimer = setInterval(() => {
     void thread.sendTyping().catch(() => {});
@@ -868,6 +889,7 @@ function stopTyping(session: SessionContext): void {
   if (session.typingTimer) {
     clearInterval(session.typingTimer);
     session.typingTimer = undefined;
+    console.log(`[Typing:${ session.threadId }] Stopped typing loop`);
   }
 }
 
@@ -1257,6 +1279,13 @@ async function handleRpcEvent(
           .catch(() => {});
       }
       session.confirmationPending = false;
+    } else if (id && method !== "setWidget" && method !== "setStatus" && method !== "notify" && method !== "setTitle") {
+      console.warn(`[RPC:${ thread.id }] ⚠️ Unhandled interactive extension_ui_request method: "${ method }" (id: ${ id }). Auto-cancelling request to prevent OMP deadlock.`);
+      sendRpc(session, {
+        type: "extension_ui_response",
+        id,
+        cancelled: true,
+      });
     }
     return;
   }
@@ -1465,9 +1494,14 @@ async function handleRpcEvent(
     sendRpc(session, { id: `sync_think_${ Date.now() }`, type: "get_state" });
     return;
   }
+  if (type === "rpc_chunk") {
+    console.warn(`[RPC:${ thread.id }] ⚠️ Unhandled protocol v2 rpc_chunk frame reached event handler (chunkId: ${ String(event.chunkId) }).`);
+    return;
+  }
 
   // 8. Turn Finish
   if (type === "agent_end") {
+    console.log(`[RPC:${ thread.id }] Processing agent_end (buffer length: ${ session.currentStreamBuffer.length }, traces: ${ session.toolTraceHistory?.length ?? 0 })`);
     if (session.isRewinding) {
       session.isRunning = false;
       session.confirmationPending = false;
@@ -1558,6 +1592,7 @@ async function handleRpcEvent(
 
   // 9. Prompt Result, including local command completion without agent_end.
   if (type === "prompt_result") {
+    console.log(`[RPC:${ thread.id }] Processing prompt_result (agentInvoked: ${ String(event.agentInvoked) })`);
     if (session.isRewinding) {
       session.isRunning = false;
       session.confirmationPending = false;
@@ -2382,6 +2417,7 @@ client.on("messageCreate", async (message) => {
     stopTyping(session);
     return;
   }
+  console.log(`[Chat:${ message.channelId }] User prompt from @${ message.author.tag }: "${ text.slice(0, 80).replace(/\n/g, " ") }${ text.length > 80 ? "..." : "" }"`);
 
   if (message.channel.isThread()) {
     startTyping(session, message.channel);

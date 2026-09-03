@@ -181,7 +181,7 @@ describe("models - getModelSuggestions", () => {
 });
 
 describe("models - OMP live integration", () => {
-  it("launches OMP with resolved model and successfully initializes on litellm", async () => {
+  it.skipIf(!Bun.which("omp"))("launches OMP with resolved model and successfully initializes on litellm", async () => {
     const resolved = resolveModelSelector("openai/gpt-5.6-luna", mockModels);
     expect(resolved).toBe("litellm/openai/gpt-5.6-luna");
 
