@@ -52,6 +52,7 @@ const TOOL_ICONS: Record<string, string> = {
   glob: "📂",
   eval: "⚙️",
   lsp: "🧠",
+  upload_artifact: "📎",
 };
 
 export function toolIcon(toolName: string): string {

@@ -11,7 +11,8 @@ An interactive Discord Gateway for **Oh My Pi (`omp`)**, enabling complete sessi
   - `/skill <name> <prompt>` — Rich autocomplete for all OMX workflows (`$ralph`, `$plan`, `$deep-interview`, `$code-review`, `$tdd`, etc.).
   - `/cmd <command> [args]` — Rich autocomplete for all 102+ native OMP commands and subcommands (`/security`, `/advisor`, `/prewalk`, `/dump`, etc.).
   - `/model [selection]` — Real-time model switcher with context window indicators.
-  - `/omp-new`, `/omp-terminate-all`, `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`.
+  - `/omp-new`, `/omp-terminate-all`, `/fast`, `/think`, `/compact`, `/abort`, `/status`, `/undo`, `/tree`, `/export`, `/download`, `/diff`, `/commit`.
+- **Explicit Artifact Delivery (`upload_artifact`)**: Agents can upload generated files from the workspace directly to the active Discord thread via a native RPC host tool.
 - **Interactive UI Approvals**: Confirmation requests (`extension_ui_request`) render as Discord **Action Buttons** (`Approve` / `Deny`) with timeout handling.
 - **Systemd User Service & Docker**: One-command daemonization via `./scripts/init.sh` or isolated containerized deployment with `docker compose`.
 
@@ -147,6 +148,9 @@ journalctl --user -u omp-discord-bot.service -f
 | `/undo` | Rolls back the previous turn. |
 | `/tree` | Inspects the session branch tree. |
 | `/export` | Exports the session transcript to an HTML file. |
+| `/download [path]` | Downloads a file from the session workspace to the Discord thread (manual fallback for generated artifacts, subject to Discord's 25 MiB limit). |
+| `/diff [staged] [path]` | Inspects git diffs in the session workspace. |
+| `/commit [message]` | Commits staged or tracked changes in the session workspace. |
 
 ### Skills & Native Commands
 
@@ -163,6 +167,14 @@ journalctl --user -u omp-discord-bot.service -f
 Inside any thread created by `/omp-new`:
 - Plain text messages are dispatched directly to the agent as prompts.
 - Inline syntax like `$ralph Fix test regressions` or `/model claude-sonnet-4-5` works seamlessly.
+
+### Artifact Delivery (`upload_artifact`)
+
+The bridge automatically registers the native OMP RPC host tool `upload_artifact` upon session initialization:
+- **Explicit Invocations**: Agents invoke `upload_artifact(path="...", description="...")` when users request a generated file.
+- **Security & Containment**: Paths are resolved relative to the session root (`session.cwd`). Traversals (`../`), absolute paths outside the workspace, and symlink escapes are strictly rejected.
+- **Attachment Limits**: Enforces Discord's 25 MiB limit; files exceeding this limit return a structured error to the agent before upload.
+- **Manual Fallback**: Users can manually retrieve any workspace file at any time with `/download <path>`.
 
 ---
 

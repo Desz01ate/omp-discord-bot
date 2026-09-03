@@ -10,6 +10,14 @@ import type { ToolExecutionTrace } from "./observability";
 import type { TurnCheckpoint, PendingRpcRequest } from "./rewind";
 import type { RpcFrameDecoder } from "./rpc-decoder";
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
+export interface PendingHostToolCall {
+  id: string;
+  toolCallId: string;
+  toolName: string;
+  resolve: (result: Record<string, unknown>) => void;
+  reject: (error: Error) => void;
+  abortController: AbortController;
+}
 
 export interface SessionContext {
   process: OmpProcess;
@@ -49,6 +57,8 @@ export interface SessionContext {
   isRewinding?: boolean;
   /** Active pending RPC requests awaiting response frames. */
   pendingRpcRequests?: Map<string, PendingRpcRequest>;
+  /** Active pending host tool calls executing on behalf of OMP. */
+  pendingHostToolCalls?: Map<string, PendingHostToolCall>;
   /** Cumulative token metrics across prompts/turns in this session. */
   cumulativeTokens?: { input: number; output: number };
   /** Live subagents currently registered or executing in OMP. */
@@ -270,6 +280,13 @@ export class SessionManager {
         }
         session.pendingRpcRequests.clear();
       }
+      if (session.pendingHostToolCalls) {
+        for (const [, call] of session.pendingHostToolCalls) {
+          call.abortController.abort(new Error("Session deactivated"));
+          call.reject(new Error("Session deactivated"));
+        }
+        session.pendingHostToolCalls.clear();
+      }
       session.checkpoints = [];
       session.rpcDecoder?.reset();
       try {
@@ -357,6 +374,13 @@ export class SessionManager {
           req.reject(new Error("Session terminated"));
         }
         session.pendingRpcRequests.clear();
+      }
+      if (session.pendingHostToolCalls) {
+        for (const [, call] of session.pendingHostToolCalls) {
+          call.abortController.abort(new Error("Session terminated"));
+          call.reject(new Error("Session terminated"));
+        }
+        session.pendingHostToolCalls.clear();
       }
       session.checkpoints = [];
       try {

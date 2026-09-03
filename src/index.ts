@@ -136,6 +136,172 @@ function sendRpc(session: SessionContext, command: Record<string, unknown>): voi
   session.process.stdin.write(line);
   session.process.stdin.flush();
 }
+const UPLOAD_ARTIFACT_TOOL_DEFINITION = {
+  name: "upload_artifact",
+  label: "Upload artifact to Discord",
+  description: "Upload one file from the current workspace to the active Discord thread. Use this when the user asks to receive a generated file.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        description: "Workspace-relative path of the file to upload",
+      },
+      description: {
+        type: "string",
+        description: "Optional short caption shown with the Discord attachment",
+      },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+};
+
+function sanitizeAttachmentFilename(relativePath: string): string {
+  const base = basename(relativePath);
+  return base.replace(/[^a-zA-Z0-9._-]/g, "_") || "artifact";
+}
+
+function sendHostToolResult(
+  session: SessionContext,
+  id: string,
+  text: string,
+  details: Record<string, unknown> = {},
+  isError = false,
+): void {
+  try {
+    sendRpc(session, {
+      type: "host_tool_result",
+      id,
+      result: {
+        content: [{ type: "text", text }],
+        details,
+      },
+      isError,
+    });
+  } catch (err) {
+    console.error(`[RPC:${ session.threadId }] Failed to send host tool result:`, err);
+  }
+}
+
+async function handleUploadArtifactCall(
+  session: SessionContext,
+  thread: ThreadChannel,
+  request: { id: string; toolCallId: string; toolName: string; arguments?: Record<string, unknown> },
+): Promise<void> {
+  const { id } = request;
+  session.pendingHostToolCalls ||= new Map();
+  if (session.pendingHostToolCalls.has(id)) {
+    return;
+  }
+
+  const abortController = new AbortController();
+  let settled = false;
+
+  const settle = (text: string, details: Record<string, unknown> = {}, isError = false) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    session.pendingHostToolCalls?.delete(id);
+    sendHostToolResult(session, id, text, details, isError);
+  };
+
+  session.pendingHostToolCalls.set(id, {
+    id,
+    toolCallId: request.toolCallId,
+    toolName: request.toolName,
+    resolve: () => {},
+    reject: (error) => {
+      settle(error instanceof Error && error.message ? error.message : "Host tool call was rejected", {}, true);
+    },
+    abortController,
+  });
+
+  if (abortController.signal.aborted) {
+    settle("Host tool call was cancelled", {}, true);
+    return;
+  }
+
+  const args = request.arguments && typeof request.arguments === "object" ? request.arguments : {};
+  const requestedPath = typeof args.path === "string" ? args.path : "";
+  const caption = typeof args.description === "string" ? args.description.trim() : "";
+
+  if (!requestedPath.trim()) {
+    settle("A workspace-relative file path is required.", {}, true);
+    return;
+  }
+
+  const resolved = resolveWorkspaceFile(session.cwd, requestedPath);
+  if (!resolved.ok || !resolved.file) {
+    settle(resolved.error || "Unable to resolve that file in the workspace.", {}, true);
+    return;
+  }
+
+  if (!isDownloadableWorkspaceFile(resolved.file)) {
+    const mb = Math.ceil(resolved.file.size / (1024 * 1024));
+    settle(`File size (${ mb }MB) exceeds Discord's 25MB attachment limit.`, {}, true);
+    return;
+  }
+
+  if (abortController.signal.aborted) {
+    settle("Host tool call was cancelled", {}, true);
+    return;
+  }
+
+  let contents: Buffer;
+  try {
+    contents = readFileSync(resolved.file.absolutePath);
+  } catch {
+    settle("Unable to read the file from the session workspace.", {}, true);
+    return;
+  }
+
+  if (contents.byteLength > MAX_WORKSPACE_DOWNLOAD_BYTES) {
+    settle("The file grew beyond Discord's 25MB attachment limit while it was being read.", {}, true);
+    return;
+  }
+
+  if (abortController.signal.aborted) {
+    settle("Host tool call was cancelled", {}, true);
+    return;
+  }
+
+  const safeFilename = sanitizeAttachmentFilename(resolved.file.relativePath);
+
+  try {
+    const sentMsg = await thread.send({
+      content: caption || undefined,
+      files: [{ attachment: contents, name: safeFilename }],
+    });
+    recordAssistantMessage(session, sentMsg.id);
+    settle(
+      `Uploaded ${ safeFilename } (${ contents.byteLength } bytes) to the active Discord thread.`,
+      {
+        path: resolved.file.relativePath,
+        filename: safeFilename,
+        size: contents.byteLength,
+        messageId: sentMsg.id,
+      },
+      false,
+    );
+  } catch (err) {
+    const discordError = err instanceof Error ? err.message : "Discord upload failed";
+    settle(`Failed to upload attachment to Discord: ${ discordError }`, {}, true);
+  }
+}
+
+function handleHostToolCancel(
+  session: SessionContext,
+  targetId: string,
+): void {
+  const pending = session.pendingHostToolCalls?.get(targetId);
+  if (!pending) {
+    return;
+  }
+  pending.abortController.abort(new Error("Host tool cancelled by OMP"));
+  pending.reject(new Error("Host tool call was cancelled"));
+}
 
 /**
  * Detect git branch or short commit hash for a directory if it is a git repo.
@@ -589,6 +755,7 @@ function createOmpSession(
     checkpoints: restoredCheckpoints,
     pendingRpcRequests: new Map(),
     cumulativeTokens: { input: 0, output: 0 },
+    pendingHostToolCalls: new Map(),
     activeSubagentsMap: new Map(),
     rpcDecoder: new RpcFrameDecoder(),
   };
@@ -639,6 +806,13 @@ function createOmpSession(
         req.reject(new Error(`OMP process exited with code ${ code }`));
       }
       session.pendingRpcRequests.clear();
+    }
+    if (session.pendingHostToolCalls) {
+      for (const [, call] of session.pendingHostToolCalls) {
+        call.abortController.abort(new Error(`OMP process exited with code ${ code }`));
+        call.reject(new Error("OMP process exited before host tool completed"));
+      }
+      session.pendingHostToolCalls.clear();
     }
     clearTimeout(session.hudUpdateTimer);
     session.hudUpdateTimer = undefined;
@@ -745,6 +919,9 @@ function formatToolStatus(toolName: string, rawArgs?: unknown, rawIntent?: unkno
 
   if (toolName === "lsp" && typeof args.action === "string") {
     return `🧠 \`lsp\`: *${ args.action }*`;
+  }
+  if (toolName === "upload_artifact" && typeof args.path === "string") {
+    return `📎 \`upload_artifact\`: \`${ args.path }\``;
   }
 
   return `🔧 *Running \`${ toolName }\`...*`;
@@ -1100,6 +1277,11 @@ async function handleRpcEvent(
       id: "init_state",
       type: "get_state",
     });
+    sendRpc(session, {
+      id: "init_host_tools",
+      type: "set_host_tools",
+      tools: [UPLOAD_ARTIFACT_TOOL_DEFINITION],
+    });
     return;
   }
 
@@ -1158,6 +1340,31 @@ async function handleRpcEvent(
     return;
   }
   // 4. Tool Execution Events
+  // 4. Host Tool Invocations and Cancellations
+  if (type === "host_tool_call") {
+    const id = typeof event.id === "string" ? event.id : "";
+    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : id;
+    const toolName = typeof event.toolName === "string" ? event.toolName : "";
+    const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
+    if (!id || !toolName) {
+      return;
+    }
+    if (toolName === "upload_artifact") {
+      void handleUploadArtifactCall(session, thread, { id, toolCallId, toolName, arguments: args });
+    } else {
+      sendHostToolResult(session, id, `Host tool "${ toolName }" is not registered`, {}, true);
+    }
+    return;
+  }
+
+  if (type === "host_tool_cancel") {
+    const targetId = typeof event.targetId === "string" ? event.targetId : "";
+    if (targetId) {
+      handleHostToolCancel(session, targetId);
+    }
+    return;
+  }
+
   if (type === "tool_execution_start") {
     await handleToolExecutionStart(session, thread, event);
     return;
