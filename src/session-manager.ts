@@ -48,6 +48,10 @@ export interface SessionContext {
   isRewinding?: boolean;
   /** Active pending RPC requests awaiting response frames. */
   pendingRpcRequests?: Map<string, PendingRpcRequest>;
+  /** Cumulative token metrics across prompts/turns in this session. */
+  cumulativeTokens?: { input: number; output: number };
+  /** Live subagents currently registered or executing in OMP. */
+  activeSubagentsMap?: Map<string, { id: string; agent: string; description?: string }>;
 }
 export interface SessionManagerOptions {
   store?: SessionStore;

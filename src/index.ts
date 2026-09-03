@@ -60,11 +60,17 @@ import {
   type WorktreeInfo,
 } from "./workspace";
 import {
-  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  extractEventUsage,
   formatHudEmbed,
   formatToolExecutionEmbed,
   formatToolOutputPreview,
   formatToolTracesEmbed,
+  mergeHudState,
+  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  readModelDisplay,
+  readNumericValue,
+  readSubagentState,
+  readTokenUsage,
   toolIcon,
   type HudState,
   type ToolExecutionTrace,
@@ -171,85 +177,6 @@ async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dir
   } catch {
     return { branch: null, dirty: null };
   }
-}
-
-function readNumericValue(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
-    return Number(value);
-  }
-  return undefined;
-}
-
-function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
-  const usage = (data.contextUsage || data.tokenUsage || data.usage) as Record<string, unknown> | undefined;
-  const source = usage && typeof usage === "object" ? usage : data;
-  const input = readNumericValue(source.input ?? source.inputTokens ?? source.promptTokens);
-  const output = readNumericValue(source.output ?? source.outputTokens ?? source.completionTokens);
-  const total = readNumericValue(source.total ?? source.totalTokens ?? source.tokens ?? (input != null && output != null ? input + output : undefined));
-  const contextWindow = readNumericValue(source.contextWindow ?? data.contextWindow);
-  const contextPercent = readNumericValue(source.percent ?? source.contextPercent ?? data.contextPercent);
-  return { input, output, total, contextWindow, contextPercent };
-}
-
-function readModelDisplay(data: Record<string, unknown>): string | undefined {
-  if (typeof data.model === "string") {
-    return data.model;
-  }
-  if (!data.model || typeof data.model !== "object") {
-    return undefined;
-  }
-  const model = data.model as Record<string, unknown>;
-  const id = typeof model.id === "string" ? model.id : undefined;
-  const name = typeof model.name === "string" ? model.name : undefined;
-  const provider = typeof model.provider === "string" ? model.provider : undefined;
-  if (!id && !name) {
-    return undefined;
-  }
-  return `${provider ? `${ provider }/` : ""}${ id || name }${id && name ? ` (${ name })` : ""}`;
-}
-
-function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
-  const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
-  if (typeof raw === "number") {
-    return raw;
-  }
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-  return raw.map((agent) => {
-    if (typeof agent === "string") {
-      return agent;
-    }
-    if (agent && typeof agent === "object") {
-      const item = agent as Record<string, unknown>;
-      return String(item.name ?? item.id ?? item.role ?? "subagent");
-    }
-    return "subagent";
-  });
-}
-
-function mergeHudState(session: SessionContext, data: Record<string, unknown>, activeTool?: string): HudState {
-  const previous = (session.hudState || {}) as HudState;
-  const next: HudState = {
-    ...previous,
-    model: readModelDisplay(data) || previous.model,
-    reasoningLevel: typeof data.thinkingLevel === "string"
-      ? data.thinkingLevel
-      : typeof data.reasoningLevel === "string"
-        ? data.reasoningLevel
-        : previous.reasoningLevel,
-    tokens: readTokenUsage(data),
-    activeSubagents: readSubagentState(data) ?? previous.activeSubagents,
-    activeTool: activeTool === undefined ? previous.activeTool : activeTool,
-    turnStatus: previous.turnStatus,
-    cwd: session.cwd,
-    updatedAt: Date.now(),
-  };
-  session.hudState = next as unknown as Record<string, unknown>;
-  return next;
 }
 
 async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
@@ -659,6 +586,8 @@ function createOmpSession(
     toolTraceHistory: [],
     checkpoints: restoredCheckpoints,
     pendingRpcRequests: new Map(),
+    cumulativeTokens: { input: 0, output: 0 },
+    activeSubagentsMap: new Map(),
   };
   void ensurePinnedHud(session, thread);
 
@@ -1053,6 +982,19 @@ async function handleToolExecutionEnd(session: SessionContext, thread: ThreadCha
 
 
 
+function syncSubagentsHud(session: SessionContext, thread: ThreadChannel): void {
+  session.activeSubagentsMap ||= new Map();
+  const activeList = [...session.activeSubagentsMap.values()].map((s) => s.agent || s.id);
+  const current = (session.hudState || { cwd: session.cwd }) as HudState;
+  session.hudState = {
+    ...current,
+    activeSubagents: activeList,
+    cwd: session.cwd,
+    updatedAt: Date.now(),
+  } as unknown as Record<string, unknown>;
+  scheduleHudUpdate(session, thread);
+}
+
 function updateSubagentHud(session: SessionContext, thread: ThreadChannel, delta: number): void {
   const current = (session.hudState || { cwd: session.cwd }) as HudState;
   const raw = current.activeSubagents;
@@ -1091,6 +1033,11 @@ async function handleRpcEvent(
       id: "init",
       type: "negotiate_protocol",
       protocolVersion: 2,
+    });
+    sendRpc(session, {
+      id: "init_subagent_sub",
+      type: "set_subagent_subscription",
+      level: "progress",
     });
     sendRpc(session, {
       id: "init_state",
@@ -1176,7 +1123,33 @@ async function handleRpcEvent(
   }
 
   if (type === "turn_end") {
-    updateHudActivity(session, thread, undefined, "idle");
+    const usage = extractEventUsage(event);
+    if (usage) {
+      session.cumulativeTokens ||= { input: 0, output: 0 };
+      if (usage.input != null) {
+        session.cumulativeTokens.input += usage.input;
+      }
+      if (usage.output != null) {
+        session.cumulativeTokens.output += usage.output;
+      }
+      const prevHud = (session.hudState || { cwd: session.cwd }) as HudState;
+      const prevTokens = prevHud.tokens || {};
+      session.hudState = {
+        ...prevHud,
+        tokens: {
+          ...prevTokens,
+          input: session.cumulativeTokens.input,
+          output: session.cumulativeTokens.output,
+        },
+        turnStatus: "idle",
+        activeTool: undefined,
+        cwd: session.cwd,
+        updatedAt: Date.now(),
+      } as unknown as Record<string, unknown>;
+      scheduleHudUpdate(session, thread);
+    } else {
+      updateHudActivity(session, thread, undefined, "idle");
+    }
     session.activeToolStatus = undefined;
     return;
   }
@@ -1253,6 +1226,71 @@ async function handleRpcEvent(
     return;
   }
 
+  if (type === "subagent_lifecycle") {
+    const payload = event.payload as {
+      id?: string;
+      agent?: string;
+      status?: string;
+      description?: string;
+    } | undefined;
+    if (payload?.id) {
+      session.activeSubagentsMap ||= new Map();
+      if (payload.status === "started") {
+        session.activeSubagentsMap.set(payload.id, {
+          id: payload.id,
+          agent: payload.agent || "subagent",
+          description: payload.description,
+        });
+      } else {
+        session.activeSubagentsMap.delete(payload.id);
+      }
+      syncSubagentsHud(session, thread);
+    }
+    return;
+  }
+
+  if (type === "config_update") {
+    const data = event as Record<string, unknown>;
+    const model = readModelDisplay(data);
+    const thinkingLevel = typeof data.thinkingLevel === "string" ? data.thinkingLevel : undefined;
+    const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
+    session.hudState = {
+      ...currentHud,
+      ...(model ? { model } : {}),
+      ...(thinkingLevel ? { reasoningLevel: thinkingLevel } : {}),
+      cwd: session.cwd,
+      updatedAt: Date.now(),
+    } as unknown as Record<string, unknown>;
+    scheduleHudUpdate(session, thread);
+    return;
+  }
+
+  if (type === "model_changed") {
+    sendRpc(session, { id: `sync_model_${ Date.now() }`, type: "get_state" });
+    return;
+  }
+
+  if (type === "thinking_level_changed") {
+    const thinkingLevel = typeof event.thinkingLevel === "string" ? event.thinkingLevel : undefined;
+    if (thinkingLevel) {
+      const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
+      session.hudState = {
+        ...currentHud,
+        reasoningLevel: thinkingLevel,
+        cwd: session.cwd,
+        updatedAt: Date.now(),
+      } as unknown as Record<string, unknown>;
+      scheduleHudUpdate(session, thread);
+    } else {
+      sendRpc(session, { id: `sync_think_${ Date.now() }`, type: "get_state" });
+    }
+    return;
+  }
+
+  if (type === "subagent_progress" || type === "subagent_event" || type === "subagent_update") {
+    return;
+  }
+
   if (type === "subagent_start") {
     updateSubagentHud(session, thread, 1);
     return;
@@ -1260,9 +1298,6 @@ async function handleRpcEvent(
 
   if (type === "subagent_end" || type === "subagent_result") {
     updateSubagentHud(session, thread, -1);
-    return;
-  }
-  if (type === "subagent_update") {
     return;
   }
 
@@ -1366,6 +1401,29 @@ async function handleRpcEvent(
     }
     return;
   }
+  if (type === "response" && event.command === "get_subagents" && event.data && typeof event.data === "object") {
+    const data = event.data as { subagents?: Array<{ id: string; agent?: string; status?: string; description?: string }> };
+    session.activeSubagentsMap ||= new Map();
+    session.activeSubagentsMap.clear();
+    if (Array.isArray(data.subagents)) {
+      for (const s of data.subagents) {
+        if (s && s.id && (s.status === "running" || s.status === "started")) {
+          session.activeSubagentsMap.set(s.id, {
+            id: s.id,
+            agent: s.agent || "subagent",
+            description: s.description,
+          });
+        }
+      }
+    }
+    syncSubagentsHud(session, thread);
+    return;
+  }
+
+  if (type === "response" && event.command === "set_thinking_level") {
+    sendRpc(session, { id: `sync_think_${ Date.now() }`, type: "get_state" });
+    return;
+  }
 
   // 8. Turn Finish
   if (type === "agent_end") {
@@ -1423,10 +1481,25 @@ async function handleRpcEvent(
     }
 
     session.completionBarAttached = true;
+    const usage = extractEventUsage(event);
+    if (usage) {
+      session.cumulativeTokens ||= { input: 0, output: 0 };
+      if (usage.input != null) {
+        session.cumulativeTokens.input += usage.input;
+      }
+      if (usage.output != null) {
+        session.cumulativeTokens.output += usage.output;
+      }
+    }
     const gitSnapshot = await getGitSnapshot(session.cwd);
     const currentHud = (session.hudState || { cwd: session.cwd }) as HudState;
+    const prevTokens = currentHud.tokens || {};
     session.hudState = {
       ...currentHud,
+      tokens: {
+        ...prevTokens,
+        ...(session.cumulativeTokens ? { input: session.cumulativeTokens.input, output: session.cumulativeTokens.output } : {}),
+      },
       branch: gitSnapshot.branch || undefined,
       gitDirty: gitSnapshot.dirty === null ? undefined : gitSnapshot.dirty,
       updatedAt: Date.now(),
@@ -1436,8 +1509,10 @@ async function handleRpcEvent(
     session.activeToolStatus = undefined;
     updateHudActivity(session, thread, undefined, "idle");
 
-    // Sync checkpoint entryIds with OMP transcript
+    // Sync checkpoint entryIds with OMP transcript and refresh latest session state & subagents
     sendRpc(session, { id: `sync_branch_${ Date.now() }`, type: "get_branch_messages" });
+    sendRpc(session, { id: `sync_state_${ Date.now() }`, type: "get_state" });
+    sendRpc(session, { id: `sync_subagents_${ Date.now() }`, type: "get_subagents" });
     return;
   }
 
@@ -1509,8 +1584,10 @@ async function handleRpcEvent(
     session.activeToolStatus = undefined;
     updateHudActivity(session, thread, undefined, "idle");
 
-    // Sync checkpoint entryIds with OMP transcript
+    // Sync checkpoint entryIds with OMP transcript and refresh latest session state & subagents
     sendRpc(session, { id: `sync_branch_${ Date.now() }`, type: "get_branch_messages" });
+    sendRpc(session, { id: `sync_state_${ Date.now() }`, type: "get_state" });
+    sendRpc(session, { id: `sync_subagents_${ Date.now() }`, type: "get_subagents" });
   }
 }
 
@@ -2073,6 +2150,12 @@ client.on("interactionCreate", async (interaction) => {
     const selection = interaction.options.getString("selection");
     if (selection) {
       await interaction.reply(`🔄 Switching model to \`${ selection }\`...`);
+      session.hudState = {
+        ...(session.hudState || { cwd: session.cwd }),
+        model: selection,
+        updatedAt: Date.now(),
+      } as unknown as Record<string, unknown>;
+      scheduleHudUpdate(session);
       sendRpc(session, {
         id: `model_${ Date.now() }`,
         type: "prompt",
@@ -2103,6 +2186,12 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "think") {
     const level = interaction.options.getString("level", true);
     await interaction.reply(`🧠 Setting thinking level to \`${ level }\`...`);
+    session.hudState = {
+      ...(session.hudState || { cwd: session.cwd }),
+      reasoningLevel: level,
+      updatedAt: Date.now(),
+    } as unknown as Record<string, unknown>;
+    scheduleHudUpdate(session);
     sendRpc(session, { id: "think_set", type: "set_thinking_level", level });
     return;
   }
