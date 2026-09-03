@@ -4,8 +4,8 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { resolveWorkspaceFile, MAX_WORKSPACE_DOWNLOAD_BYTES } from "./workspace";
 import { toolIcon } from "./observability";
+import { handleHostToolCancel, handleUploadArtifactCall } from "./artifact-host-tool";
 import { type SessionContext, type PendingHostToolCall } from "./session-manager";
-
 describe("upload_artifact host tool path & attachment validation", () => {
   const testDir = join(tmpdir(), "omp-upload-artifact-test-" + Date.now());
 
@@ -80,6 +80,113 @@ describe("upload_artifact host tool path & attachment validation", () => {
     expect(toolIcon("upload_artifact")).toBe("📎");
     expect(toolIcon("UPLOAD_ARTIFACT")).toBe("📎");
   });
+  it("uploads a valid workspace file and returns structured details", async () => {
+    const filePath = join(testDir, "report.md");
+    writeFileSync(filePath, "# Report\n");
+    const sentFrames: Record<string, unknown>[] = [];
+    const sentMessages: Array<Record<string, unknown>> = [];
+    let resolveSend: ((message: { id: string }) => void) | undefined;
+    const session = {
+      cwd: testDir,
+      threadId: "thread_upload",
+      currentStreamBuffer: "",
+      lastEditTimestamp: 0,
+      pendingHostToolCalls: new Map(),
+    } as unknown as SessionContext;
+    const thread = {
+      send: async (message: Record<string, unknown>) => {
+        sentMessages.push(message);
+        return new Promise<{ id: string }>((resolve) => {
+          resolveSend = resolve;
+        });
+      },
+    };
+
+    const upload = handleUploadArtifactCall(
+      session,
+      thread as never,
+      { id: "call_upload", toolCallId: "tool_upload", toolName: "upload_artifact", arguments: { path: "report.md", description: "Generated report" } },
+      (_session, frame) => sentFrames.push(frame),
+    );
+    await Promise.resolve();
+    expect(sentMessages).toHaveLength(1);
+    expect(sentMessages[0].content).toBe("Generated report");
+    expect((sentMessages[0].files as Array<{ name: string }>)[0].name).toBe("report.md");
+    resolveSend?.({ id: "discord_message" });
+    await upload;
+
+    expect(sentFrames).toHaveLength(1);
+    expect(sentFrames[0].type).toBe("host_tool_result");
+    expect((sentFrames[0].result as { details: Record<string, unknown> }).details).toEqual({
+      path: "report.md",
+      filename: "report.md",
+      size: 9,
+      messageId: "discord_message",
+    });
+  });
+
+  it("cancels an upload without sending a duplicate result", async () => {
+    writeFileSync(join(testDir, "report.md"), "# Report\n");
+    const sentFrames: Record<string, unknown>[] = [];
+    const session = {
+      cwd: testDir,
+      threadId: "thread_cancel",
+      currentStreamBuffer: "",
+      lastEditTimestamp: 0,
+      pendingHostToolCalls: new Map(),
+    } as unknown as SessionContext;
+    let resolveSend: ((message: { id: string }) => void) | undefined;
+    const thread = {
+      send: async () => new Promise<{ id: string }>((resolve) => {
+        resolveSend = resolve;
+      }),
+    };
+
+    const upload = handleUploadArtifactCall(
+      session,
+      thread as never,
+      { id: "call_cancel", toolCallId: "tool_cancel", toolName: "upload_artifact", arguments: { path: "report.md" } },
+      (_session, frame) => sentFrames.push(frame),
+    );
+    await Promise.resolve();
+    handleHostToolCancel(session, "call_cancel");
+    resolveSend?.({ id: "late_message" });
+    await upload;
+
+    expect(sentFrames).toHaveLength(1);
+    expect(sentFrames[0].isError).toBe(true);
+    expect((sentFrames[0].result as { content: Array<{ text: string }> }).content[0].text).toBe("Host tool call was cancelled");
+  });
+
+  it("returns a host-tool error without uploading an unsafe path", async () => {
+    const sentFrames: Record<string, unknown>[] = [];
+    let sendCount = 0;
+    const session = {
+      cwd: testDir,
+      threadId: "thread_invalid",
+      currentStreamBuffer: "",
+      lastEditTimestamp: 0,
+      pendingHostToolCalls: new Map(),
+    } as unknown as SessionContext;
+    const thread = {
+      send: async () => {
+        sendCount++;
+        return { id: "unexpected" };
+      },
+    };
+
+    await handleUploadArtifactCall(
+      session,
+      thread as never,
+      { id: "call_invalid", toolCallId: "tool_invalid", toolName: "upload_artifact", arguments: { path: "../secret.txt" } },
+      (_session, frame) => sentFrames.push(frame),
+    );
+
+    expect(sendCount).toBe(0);
+    expect(sentFrames).toHaveLength(1);
+    expect(sentFrames[0].isError).toBe(true);
+  });
+
 });
 
 describe("Host tool lifecycle and cancellation settlement", () => {
