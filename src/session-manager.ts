@@ -8,6 +8,7 @@ import { createSessionStore } from "./storage";
 import { removeGitWorktree, type WorktreeInfo } from "./workspace";
 import type { ToolExecutionTrace } from "./observability";
 import type { TurnCheckpoint, PendingRpcRequest } from "./rewind";
+import type { RpcFrameDecoder } from "./rpc-decoder";
 export type OmpProcess = Subprocess<"pipe", "pipe", "inherit">;
 
 export interface SessionContext {
@@ -52,6 +53,8 @@ export interface SessionContext {
   cumulativeTokens?: { input: number; output: number };
   /** Live subagents currently registered or executing in OMP. */
   activeSubagentsMap?: Map<string, { id: string; agent: string; description?: string }>;
+  /** Protocol v2 chunk reassembler for frames exceeding 1MB. */
+  rpcDecoder?: RpcFrameDecoder;
 }
 export interface SessionManagerOptions {
   store?: SessionStore;
@@ -147,6 +150,7 @@ export function stopTyping(session: SessionContext): void {
   if (session.typingTimer) {
     clearInterval(session.typingTimer);
     session.typingTimer = undefined;
+    console.log(`[Typing:${ session.threadId }] Stopped typing loop (via session-manager)`);
   }
 }
 
@@ -267,6 +271,7 @@ export class SessionManager {
         session.pendingRpcRequests.clear();
       }
       session.checkpoints = [];
+      session.rpcDecoder?.reset();
       try {
         session.process.kill();
       } catch {
