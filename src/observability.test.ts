@@ -1,19 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import {
+  extractEventUsage,
   formatHudEmbed,
   formatToolExecutionEmbed,
   formatToolOutputPreview,
   formatToolSummary,
   formatToolTracesEmbed,
-  type HudState,
-  type ToolExecutionTrace,
-} from "./observability";
-import {
-  extractEventUsage,
   mergeHudState,
   readModelDisplay,
   readTokenUsage,
-} from "./index";
+  type HudState,
+  type ToolExecutionTrace,
+} from "./observability";
 import type { SessionContext } from "./session-manager";
 describe("observability HUD formatting", () => {
   it("renders model, reasoning, token breakdown, context and git state", () => {

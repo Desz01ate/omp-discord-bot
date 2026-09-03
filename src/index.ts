@@ -60,11 +60,17 @@ import {
   type WorktreeInfo,
 } from "./workspace";
 import {
-  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  extractEventUsage,
   formatHudEmbed,
   formatToolExecutionEmbed,
   formatToolOutputPreview,
   formatToolTracesEmbed,
+  mergeHudState,
+  OBSERVABILITY_UPDATE_THROTTLE_MS,
+  readModelDisplay,
+  readNumericValue,
+  readSubagentState,
+  readTokenUsage,
   toolIcon,
   type HudState,
   type ToolExecutionTrace,
@@ -171,120 +177,6 @@ async function getGitSnapshot(cwd: string): Promise<{ branch: string | null; dir
   } catch {
     return { branch: null, dirty: null };
   }
-}
-
-export function readNumericValue(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) {
-    return Number(value);
-  }
-  return undefined;
-}
-
-export function extractEventUsage(event: Record<string, unknown>): { input?: number; output?: number; total?: number } | undefined {
-  const message = (event.message && typeof event.message === "object" ? event.message : undefined) as Record<string, unknown> | undefined;
-  let rawUsage = (message?.usage ?? event.usage) as Record<string, unknown> | undefined;
-  if (!rawUsage && Array.isArray(event.messages)) {
-    for (let i = event.messages.length - 1; i >= 0; i--) {
-      const item = event.messages[i];
-      if (item && typeof item === "object" && (item as Record<string, unknown>).usage) {
-        rawUsage = (item as Record<string, unknown>).usage as Record<string, unknown>;
-        break;
-      }
-    }
-  }
-  if (!rawUsage || typeof rawUsage !== "object") {
-    return undefined;
-  }
-  const input = readNumericValue(rawUsage.input ?? rawUsage.inputTokens ?? rawUsage.promptTokens);
-  const output = readNumericValue(rawUsage.output ?? rawUsage.outputTokens ?? rawUsage.completionTokens);
-  const total = readNumericValue(rawUsage.totalTokens ?? rawUsage.total ?? rawUsage.tokens ?? (input != null && output != null ? input + output : undefined));
-  return { input, output, total };
-}
-
-export function readTokenUsage(data: Record<string, unknown>): HudState["tokens"] {
-  const usage = (data.contextUsage || data.tokenUsage || data.usage) as Record<string, unknown> | undefined;
-  const source = usage && typeof usage === "object" ? usage : data;
-  const input = readNumericValue(source.input ?? source.inputTokens ?? source.promptTokens);
-  const output = readNumericValue(source.output ?? source.outputTokens ?? source.completionTokens);
-  const total = readNumericValue(source.total ?? source.totalTokens ?? source.tokens ?? (input != null && output != null ? input + output : undefined));
-  const contextWindow = readNumericValue(source.contextWindow ?? data.contextWindow);
-  const contextPercent = readNumericValue(source.percent ?? source.contextPercent ?? data.contextPercent);
-  return { input, output, total, contextWindow, contextPercent };
-}
-
-export function readModelDisplay(data: Record<string, unknown>): string | undefined {
-  if (typeof data.model === "string") {
-    return data.model;
-  }
-  const model = (data.model && typeof data.model === "object" ? data.model : data) as Record<string, unknown>;
-  const id = typeof model.id === "string" ? model.id : undefined;
-  const name = typeof model.name === "string" ? model.name : undefined;
-  const provider = typeof model.provider === "string" ? model.provider : undefined;
-  if (!id && !name) {
-    return undefined;
-  }
-  const base = id || name;
-  const suffix = id && name && id !== name ? ` (${ name })` : "";
-  return `${provider ? `${ provider }/` : ""}${ base }${ suffix }`;
-}
-
-export function readSubagentState(data: Record<string, unknown>): string[] | number | undefined {
-  const raw = data.activeSubagents ?? data.subagents ?? data.activeAgents;
-  if (typeof raw === "number") {
-    return raw;
-  }
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-  return raw.map((agent) => {
-    if (typeof agent === "string") {
-      return agent;
-    }
-    if (agent && typeof agent === "object") {
-      const item = agent as Record<string, unknown>;
-      return String(item.name ?? item.id ?? item.role ?? "subagent");
-    }
-    return "subagent";
-  });
-}
-
-export function mergeHudState(session: SessionContext, data: Record<string, unknown>, activeTool?: string): HudState {
-  const previous = (session.hudState || {}) as HudState;
-  const prevTokens = previous.tokens || {};
-  const newTokens = readTokenUsage(data) || {};
-
-  const resolvedInput = session.cumulativeTokens?.input ?? newTokens.input ?? prevTokens.input;
-  const resolvedOutput = session.cumulativeTokens?.output ?? newTokens.output ?? prevTokens.output;
-  const resolvedTotal = newTokens.total ?? prevTokens.total ?? (resolvedInput != null && resolvedOutput != null ? resolvedInput + resolvedOutput : undefined);
-
-  const mergedTokens: HudState["tokens"] = {
-    input: resolvedInput,
-    output: resolvedOutput,
-    total: resolvedTotal,
-    contextWindow: newTokens.contextWindow ?? prevTokens.contextWindow,
-    contextPercent: newTokens.contextPercent ?? prevTokens.contextPercent,
-  };
-
-  const next: HudState = {
-    ...previous,
-    model: readModelDisplay(data) || previous.model,
-    reasoningLevel: typeof data.thinkingLevel === "string"
-      ? data.thinkingLevel
-      : typeof data.reasoningLevel === "string"
-        ? data.reasoningLevel
-        : previous.reasoningLevel,
-    tokens: mergedTokens,
-    activeSubagents: readSubagentState(data) ?? previous.activeSubagents,
-    activeTool: activeTool === undefined ? previous.activeTool : activeTool,
-    turnStatus: previous.turnStatus,
-    cwd: session.cwd,
-    updatedAt: Date.now(),
-  };
-  session.hudState = next as unknown as Record<string, unknown>;
-  return next;
 }
 
 async function ensurePinnedHud(session: SessionContext, thread: ThreadChannel): Promise<void> {
